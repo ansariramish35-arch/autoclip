@@ -57,7 +57,16 @@ def create_app(mode: str = "web") -> FastAPI:
     )
     from backend.core.log_redaction import install_log_redaction
     install_log_redaction()
-    
+
+    # Zero-setup deployments (AUTOCLIP_OFFLINE_ENGINE=local): serve the five
+    # analysis steps locally and seed the model settings so import never asks for
+    # an API key. No-op unless that variable is set.
+    try:
+        from backend.core.offline_bootstrap import install as install_offline_engine
+        install_offline_engine()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"离线分析引擎启动失败（忽略）: {type(e).__name__}")
+
     # 创建 FastAPI 应用
     app = FastAPI(
         title="AutoClip API",

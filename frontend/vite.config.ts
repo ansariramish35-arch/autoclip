@@ -20,6 +20,11 @@ export default defineConfig(({ mode, command }) => {
   }
   const desktopVersion = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8')).version
   const appVersion = env.VITE_APP_VERSION || desktopVersion
+  // Dev-only: when the dev server is reached through a proxy that rewrites Host
+  // (e.g. a container or cloud live-preview domain), Vite's host allowlist would
+  // reject it. Opt in explicitly with VITE_DEV_ALLOWED_HOSTS; unset keeps Vite's
+  // default localhost-only behaviour.
+  const previewAllowedHosts = env.VITE_DEV_ALLOWED_HOSTS?.trim()
   
   return {
     plugins: [
@@ -42,6 +47,10 @@ export default defineConfig(({ mode, command }) => {
     ],
     define: {
       'import.meta.env.VITE_APP_VERSION': JSON.stringify(appVersion),
+      // Hosted builds call a backend on another origin; apiConfig reads this
+      // constant so the first request goes to the right host. Empty keeps the
+      // relative /api/v1 path (dev server proxy, desktop, same-origin image).
+      __AUTOCLIP_API_BASE__: JSON.stringify((env.VITE_API_BASE_URL || '').trim()),
     },
     base: isProduction ? './' : '/', // 生产环境使用相对路径
     optimizeDeps: {
@@ -74,16 +83,30 @@ export default defineConfig(({ mode, command }) => {
       },
     },
     server: {
+      host: '0.0.0.0',
       port: 3000,
       strictPort: true, // 如果端口被占用则报错，而不是自动切换
       hmr: {
         overlay: false // 禁用错误覆盖层
       },
+      // Comma-separated extra Host headers, e.g. the proxied preview domain.
+      allowedHosts: previewAllowedHosts
+        ? previewAllowedHosts.split(',').map((host) => host.trim()).filter(Boolean)
+        : undefined,
       proxy: {
         '/api': {
           // Override when the desktop backend (random port) is running: BACKEND_URL=http://127.0.0.1:PORT npm run dev
           target: process.env.BACKEND_URL || 'http://localhost:8000',
-          changeOrigin: true
+          changeOrigin: true,
+          // 预览域名是同源代理：后端看到的 Host 是 127.0.0.1:8000，而浏览器发的
+          // Origin 是预览域名。原样转发它，后端的同源判定（Origin vs X-Forwarded-Host）
+          // 才能放行写请求。
+          configure: (proxy) => {
+            proxy.on('proxyReq', (proxyReq, req) => {
+              const origin = req.headers.origin
+              if (origin) proxyReq.setHeader('X-Forwarded-Host', origin.replace(/^https?:\/\//, ''))
+            })
+          }
         }
       }
     }

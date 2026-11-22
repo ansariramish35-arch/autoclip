@@ -9,12 +9,53 @@ interface ApiConfig {
   isReady: boolean;
 }
 
+/**
+ * Hosted builds point at a backend that is not on the same origin as the page.
+ * The base URL arrives two ways, and both resolve before the first request, so
+ * the bundle never waits for a Tauri backend-ready event that cannot fire in a
+ * browser:
+ *
+ *  1. __AUTOCLIP_API_BASE__ — build-time constant injected by vite.config.ts
+ *     from VITE_API_BASE_URL and inlined as a string literal.
+ *  2. window.__AUTOCLIP_API_BASE__ — optional runtime override, so one build
+ *     can be re-pointed without rebuilding.
+ *
+ * Same-origin builds leave both unset and keep the relative /api/v1 prefix.
+ * `typeof` guards keep this safe in the node test sandbox, where neither exists.
+ */
+declare const __AUTOCLIP_API_BASE__: string;
+
+function readEnvApiBaseUrl(): string {
+  const candidates: unknown[] = [];
+  try {
+    if (typeof __AUTOCLIP_API_BASE__ !== 'undefined') candidates.push(__AUTOCLIP_API_BASE__);
+  } catch {
+    /* built without the define */
+  }
+  if (typeof window !== 'undefined') {
+    candidates.push((window as any).__AUTOCLIP_API_BASE__);
+  }
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim().replace(/\/+$/, '');
+    }
+  }
+  return '';
+}
+
+const ENV_API_BASE_URL = readEnvApiBaseUrl();
+
+const initialBaseUrl = ENV_API_BASE_URL
+  ? (ENV_API_BASE_URL.endsWith('/api/v1') ? ENV_API_BASE_URL : `${ENV_API_BASE_URL}/api/v1`)
+  : '/api/v1';
+
 class ApiConfigManager {
   private static instance: ApiConfigManager;
   private config: ApiConfig = {
-    baseUrl: '/api/v1',
+    baseUrl: initialBaseUrl,
     port: 0,
-    isReady: false
+    // A configured remote backend needs no discovery step.
+    isReady: Boolean(ENV_API_BASE_URL)
   };
   private listeners: Array<(config: ApiConfig) => void> = [];
 

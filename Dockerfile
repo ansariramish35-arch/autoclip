@@ -68,9 +68,12 @@ ENV PYTHONPATH=/app
 RUN groupadd -r autoclip && useradd -r -g autoclip autoclip
 
 # 安装运行时依赖
+# redis-server: 单容器托管模式（scripts/host-entrypoint.sh）在进程内跑 broker，
+# 免费/免费层容器平台无法附带第二个 Redis 服务。
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
+    redis-server \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -88,6 +91,7 @@ COPY scripts/ ./scripts/
 COPY init_database.py ./
 COPY env.example .env
 COPY docker-entrypoint.sh ./
+COPY scripts/host-entrypoint.sh ./
 
 # 创建必要的目录
 RUN mkdir -p data/projects data/uploads data/temp data/output logs
@@ -95,7 +99,7 @@ RUN mkdir -p data/projects data/uploads data/temp data/output logs
 # 设置权限
 RUN chown -R autoclip:autoclip /app
 RUN chmod +x *.sh
-RUN chmod +x docker-entrypoint.sh
+RUN chmod +x docker-entrypoint.sh scripts/host-entrypoint.sh
 RUN chmod -R 755 data logs
 
 # 切换到非root用户

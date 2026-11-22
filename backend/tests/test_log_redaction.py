@@ -109,3 +109,52 @@ def test_every_entry_point_calls_unified_filter():
                 "services/local_runner.py"):
         assert "install_" in (root / rel).read_text(encoding="utf-8") and \
             "log_redaction" in (root / rel).read_text(encoding="utf-8"), rel
+
+
+@pytest.mark.stdlib_only
+def test_access_log_format_still_gets_its_positional_args():
+    """uvicorn's AccessFormatter unpacks ``record.args`` into five fields.
+
+    Flattening args to ``()`` inside the filter made every request log line raise
+    "not enough values to unpack" inside logging, so the server printed a full
+    traceback per request and the access line itself was lost.
+    """
+    from uvicorn.logging import AccessFormatter
+
+    from backend.core.log_redaction import RedactingFilter
+
+    # Both halves as uvicorn ships them: the record (protocols/http/httptools_impl.py)
+    # and the output format (uvicorn/config.py LOGGING_CONFIG).
+    message = '%s - "%s %s HTTP/%s" %d'
+    output_format = '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    record = logging.LogRecord(
+        "uvicorn.access", logging.INFO, __file__, 1, message,
+        ("127.0.0.1:50000", "GET", "/api/v1/health/", "1.1", 200),
+        None,
+    )
+    RedactingFilter().filter(record)
+    formatted = AccessFormatter(output_format, use_colors=False).format(record)
+    assert 'GET /api/v1/health/ HTTP/1.1' in formatted
+    assert formatted.endswith("200 OK")
+
+
+@pytest.mark.stdlib_only
+def test_access_log_args_are_redacted_but_still_positional():
+    from uvicorn.logging import AccessFormatter
+
+    from backend.core.log_redaction import RedactingFilter
+
+    message = '%s - "%s %s HTTP/%s" %d'
+    output_format = '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    record = logging.LogRecord(
+        "uvicorn.access", logging.INFO, __file__, 1, message,
+        ("127.0.0.1:50000", "GET", f"/v1beta/models?key={SECRET}", "1.1", 200),
+        None,
+    )
+    RedactingFilter().filter(record)
+    assert len(record.args) == 5, record.args
+    path = record.args[2]
+    assert isinstance(path, str) and SECRET not in path
+    formatted = AccessFormatter(output_format, use_colors=False).format(record)
+    assert SECRET not in formatted
+    assert "?key=[REDACTED]" in formatted

@@ -52,6 +52,29 @@ def redact_text(text: str) -> str:
     return text
 
 
+# Structured formatters that unpack ``record.args`` by position after the filter runs.
+# uvicorn's AccessFormatter does exactly that with
+# (client_addr, method, full_path, http_version, status_code); logging's %-formatting
+# below it also needs the original tuple, so this message must never be collapsed.
+STRUCTURED_LOGGERS = ("uvicorn.access",)
+_SAFE_ARG_TYPES = (int, float, bool, complex)
+
+
+def redact_record_args(record: logging.LogRecord) -> bool:
+    """Redact ``record.args`` in place, keeping them positional. False if not a tuple.
+
+    Non-string scalars are passed through unchanged: rewriting ``200`` to ``"200"``
+    makes the formatter's ``%d`` raise, and a request line is not a credential.
+    """
+    if not isinstance(record.args, tuple):
+        return False
+    record.args = tuple(
+        arg if isinstance(arg, _SAFE_ARG_TYPES) else redact_text(str(arg))
+        for arg in record.args
+    )
+    return True
+
+
 class RedactingFilter(logging.Filter):
     """Rewrite msg/args/exc_text so no handler ever formats a raw credential."""
 
@@ -64,8 +87,14 @@ class RedactingFilter(logging.Filter):
             message = record.getMessage()
         except Exception:  # noqa: BLE001 - bad format args; fall back to raw msg
             message = str(record.msg)
-        record.msg = redact_text(message)
-        record.args = ()
+        if record.name in STRUCTURED_LOGGERS and redact_record_args(record):
+            # Flattening these to ``()`` made every access-log line raise
+            # "not enough values to unpack" inside logging, so the server printed a
+            # full traceback per request and the access line itself was lost.
+            pass
+        else:
+            record.msg = redact_text(message)
+            record.args = ()
         if record.exc_info and not record.exc_text:
             record.exc_text = self._formatter.formatException(record.exc_info)
         if record.exc_text:
