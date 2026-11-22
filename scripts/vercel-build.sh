@@ -24,8 +24,16 @@ for tree in backend prompt; do
   rm -rf "$API_DIR/$tree"
   cp -r "$ROOT/$tree" "$API_DIR/$tree"
 done
-# Not imported at runtime; 17 MB of the budget.
-rm -rf "$API_DIR/backend/tests"
+# Trim what packing does not need. Measured, not guessed: the bundle was 514 MB
+# against a 500 MB cap before these.
+#   tests            17 MB, never imported at runtime
+#   the Medium CJK   11 MB; every renderer loads NotoSansSC.ttf by name
+#   woff2 previews    4 MB, for the browser's font menu, not for rendering
+#   example video    17 MB, only the "try the example" button fetches it
+rm -rf "$API_DIR/backend/tests" \
+       "$API_DIR/backend/assets/fonts/NotoSansSC-Medium.ttf" \
+       "$API_DIR/backend/assets/fonts/preview" \
+       "$API_DIR/backend/assets/example/source.mp4"
 rm -rf "$API_DIR/vendor"
 mkdir -p "$API_DIR/vendor"
 cp -r "$ROOT/vendor/ffmpeg" "$API_DIR/vendor/ffmpeg"

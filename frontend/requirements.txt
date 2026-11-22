@@ -11,6 +11,12 @@
 #   pytest*         test tooling, ~15 MB of the function budget.
 #   mcp             only the `autoclip mcp` CLI entry point uses it.
 #
+# Vendor SDKs for paid LLM providers are removed as well. Every import of
+# dashscope / openai / google-genai sits inside a function body and only runs
+# when that provider is actually configured, so the key-free path never touches
+# them — but they are ~38 MB of the 500 MB cap. To use a paid provider on this
+# deployment, add its SDK back and re-measure.
+
 # ffmpeg-binaries is required: the Vercel Python image has no system ffmpeg, so
 # both static binaries (~150 MB) ship inside the function. Measured bundle:
 # ~312 MB site-packages + 150 MB binaries + ~43 MB code, under the 500 MB cap.
@@ -69,9 +75,6 @@ pytz==2026.3.post1
 # a separate, unpinned SDK installer, so the portable desktop
 # build shipped without them and any provider call failed. Bundle them so the
 # desktop app works out of the box.
-openai==3.8.0
-google-genai==2.22.0
-dashscope==1.27.4
 
 # --- test tooling ---
 # Kept here (rather than a separate dev file) because CI, the Dockerfile and the
