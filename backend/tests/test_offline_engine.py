@@ -278,8 +278,8 @@ def test_http_endpoint_speaks_openai_chat_completions(srt_text):
 
     url = offline_llm._SERVER.start("127.0.0.1", 0)
     try:
-        port = offline_llm._SERVER._httpd.server_address[1]
-        base = f"http://127.0.0.1:{port}/v1"
+        # start() reports the port the kernel actually bound (port 0 = any).
+        base = url
         models = json.loads(urllib.request.urlopen(f"{base}/models", timeout=10).read())
         assert models["data"][0]["id"] == offline_llm.MODEL_ID
 
@@ -348,3 +348,101 @@ def test_bootstrap_is_a_noop_when_disabled(tmp_path, monkeypatch):
 
     offline_bootstrap.install()
     assert not (tmp_path / "ai-model-settings.json").exists()
+
+
+# ---------------------------------------------------------------- post copy ---
+# Publishing copy is the one pipeline call whose prompt does not come from
+# prompt/knowledge, so it is imported from the module that sends it. If that
+# prompt is ever reworded, this test fails rather than the key-free deployment
+# silently shipping empty captions.
+def _post_copy_prompt() -> str:
+    from backend.services.studio import post_copy
+    return post_copy.PROMPT
+
+
+def _post_payload(**overrides):
+    payload = {
+        "title_hint": "为什么大多数公司做不好AI转型",
+        "source": "",
+        "platforms": ["douyin", "youtube_shorts"],
+        "lines": (
+            "为什么大多数公司做不好AI转型？首先是因为他们把AI当成了一个IT项目。"
+            "交给技术部门去试点，但真正的转型必须由业务部门主导。"
+            "技术部门只能做试点，一把手必须亲自推动组织变革。"
+        ),
+        "rules": {
+            "douyin": {"language": "zh", "title_max": 30, "description_max": 300,
+                       "tags": "3-5", "style": ""},
+            "youtube_shorts": {"language": "en", "title_max": 100,
+                               "description_max": 300, "tags": "3-5", "style": ""},
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_post_copy_prompt_is_recognised():
+    """The regression this test exists for: the prompt used to fall through."""
+    reply = offline_llm.answer(_post_copy_prompt(), _post_payload())
+    assert reply != "[]", "post-copy prompt was not recognised by the offline engine"
+    assert "posts" in json.loads(reply)
+
+
+def test_post_copy_satisfies_the_real_module_contract():
+    """Feed the reply through post_copy's own validation, not a copy of it."""
+    from backend.services.studio import post_copy
+
+    payload = _post_payload()
+    reply = json.loads(offline_llm.answer(_post_copy_prompt(), payload))
+    raw = reply["posts"]["douyin"]
+    rules = post_copy.RULES["douyin"]
+    assert post_copy._clean(raw["title"]) == raw["title"]
+    assert len(raw["title"]) <= rules.title_max
+    assert len(raw["description"]) <= rules.description_max
+    low, _, high = "3-5"
+    assert 0 < len(raw["tags"]) <= int(high)
+    # Every tag must be a word the speaker actually used: no invented hashtags.
+    for tag in raw["tags"]:
+        assert tag in payload["lines"], tag
+    assert "#" not in "".join(raw["tags"])
+
+
+def test_post_copy_never_ships_chinese_to_english_platforms():
+    reply = json.loads(offline_llm.answer(_post_copy_prompt(), _post_payload()))
+    english = reply["posts"]["youtube_shorts"]
+    assert english["title"] == ""
+    assert english["tags"] == []
+
+
+def test_post_copy_english_transcript_fills_english_platforms():
+    payload = _post_payload(
+        title_hint="",
+        lines=("Most companies fail at AI transformation because they treat it as an IT project. "
+               "Transformation is organizational change, and the successful companies drove "
+               "transformation from the top."),
+        platforms=["youtube_shorts"],
+    )
+    posts = json.loads(offline_llm.answer(_post_copy_prompt(), payload))["posts"]
+    title = posts["youtube_shorts"]["title"]
+    assert title.startswith("Most companies"), title
+    assert all(tag.isascii() for tag in posts["youtube_shorts"]["tags"])
+
+
+def test_post_copy_tags_skip_classifier_fragments():
+    """'一个业务' is a fragment, not a topic, and must never become a hashtag."""
+    tags = offline_llm._post_tags("组织变革需要一把手推动，一个业务部门做不了组织变革。", 5, "zh")
+    assert "一个业务" not in tags
+    assert any("组织变革" in tag or "业务" in tag for tag in tags)
+
+
+def test_post_copy_tags_never_start_with_a_function_word():
+    """A hashtag opening on 是/的/和 reads as a typo: those are mid-phrase cuts."""
+    tags = offline_llm._post_tags(
+        "AI转型本质上是组织变革。转型必须由业务一号位负责，是组织层面的问题。", 5, "zh"
+    )
+    for tag in tags:
+        assert tag[0] not in offline_llm._ZH_BAD_LEAD, tag
+
+
+def test_empty_payload_never_raises():
+    assert json.loads(offline_llm.answer(_post_copy_prompt(), {})) == {"posts": {}}

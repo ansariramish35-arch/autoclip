@@ -159,3 +159,7 @@ control/
 
 # Python 打包产物
 *.egg-info/
+
+# Static ffmpeg/ffprobe for the serverless build (157 MB). Fetched by
+# scripts/fetch-ffmpeg.sh during the Vercel build, never committed.
+vendor/ffmpeg/

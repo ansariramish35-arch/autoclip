@@ -1,0 +1,23 @@
+# Vercel bundles only what the Python function can actually run. Each entry is
+# measured: the function budget is 500 MB (Hobby/Hobby-class), and ffmpeg alone
+# is 150 MB of it.
+.venv/
+node_modules/
+frontend/node_modules/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+tests/
+backend/tests/
+data/
+logs/
+*.log
+# The sample video is 17 MB and only feeds the "try the example" button.
+backend/assets/example/source.mp4
+# A duplicate 17 MB CJK font; the renderer uses NotoSansSC.ttf.
+backend/assets/fonts/NotoSansSC-Medium.ttf
+assets/
+coverage/
+dist/
+build/

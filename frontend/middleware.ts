@@ -96,6 +96,17 @@ export default async function middleware(request: NextRequest): Promise<Response
     const lower = key.toLowerCase()
     if (lower === 'content-encoding' || lower === 'content-length' || lower === 'transfer-encoding') return
     if (lower === 'set-cookie') return // handled below, one per cookie
+    // A redirect from the engine points at the engine (e.g. /api/v1/settings ->
+    // http://engine-host/api/v1/settings/). Forwarding it would send the browser
+    // to an address it cannot reach, and would leak the internal host. Rewrite
+    // the engine origin back to the host the browser is already talking to.
+    if (lower === 'location') {
+      const rewritten = value.startsWith(TARGET)
+        ? new URL(value.slice(TARGET.length) || '/', request.url).toString()
+        : value
+      responseHeaders.set(key, rewritten)
+      return
+    }
     responseHeaders.set(key, value)
   })
   // getSetCookie keeps multiple cookies distinct; Headers.forEach would join them.

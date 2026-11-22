@@ -194,3 +194,37 @@ test('the matcher covers every /api path and nothing else', () => {
   assert.deepEqual([...config.matcher], ['/api/:path*'])
   assert.equal(config.runtime, 'nodejs')
 })
+
+// The engine answers some paths with a trailing-slash redirect. Its Location
+// header names the engine, which the browser cannot reach and must not learn, so
+// the proxy rewrites that origin back to the public one.
+test('a redirect Location pointing at the engine is rewritten to the public origin', async () => {
+  const respond = () => new Response(null, {
+    status: 307,
+    headers: { location: 'https://engine.example.com/api/v1/settings/' },
+  })
+  const { middleware, makeRequest } = load({ origin: 'https://engine.example.com', respond })
+  const response = await middleware(makeRequest('https://app.example.com/api/v1/settings', { method: 'GET' }))
+  assert.equal(response.status, 307)
+  assert.equal(response.headers.get('location'), 'https://app.example.com/api/v1/settings/')
+})
+
+test('a Location pointing somewhere else is left alone', async () => {
+  const respond = () => new Response(null, {
+    status: 302,
+    headers: { location: 'https://oauth.example.org/authorize?x=1' },
+  })
+  const { middleware, makeRequest } = load({ origin: 'https://engine.example.com', respond })
+  const response = await middleware(makeRequest('https://app.example.com/api/v1/login', { method: 'GET' }))
+  assert.equal(response.headers.get('location'), 'https://oauth.example.org/authorize?x=1')
+})
+
+test('an engine redirect with an origin-only Location becomes the app root', async () => {
+  const respond = () => new Response(null, {
+    status: 307,
+    headers: { location: 'https://engine.example.com' },
+  })
+  const { middleware, makeRequest } = load({ origin: 'https://engine.example.com', respond })
+  const response = await middleware(makeRequest('https://app.example.com/api/v1/ping', { method: 'GET' }))
+  assert.equal(response.headers.get('location'), 'https://app.example.com/')
+})

@@ -47,6 +47,7 @@ _TIMELINE_MARKER = "定位出每个话题精确的"
 _SCORING_MARKER = "进行综合评估，并给出一个最终分数"
 _TITLE_MARKER = "生成**1个**最佳的"
 _CLUSTER_MARKER = "对它们进行主题聚类"
+_POST_COPY_MARKER = "为 platforms 里的每个平台写发布文案"
 
 # Sentence-final punctuation, plus soft breaks CJK subtitles actually use.
 _SENTENCE_END = "。！？!?；;….．"
@@ -475,6 +476,9 @@ def answer(prompt: str, input_data: Any = None) -> str:
         clips = _parse_cluster_prompt(prompt)
         return json.dumps(cluster_clips(clips), ensure_ascii=False)
 
+    if _POST_COPY_MARKER in prompt:
+        return json.dumps(build_posts(payload if isinstance(payload, dict) else {}), ensure_ascii=False)
+
     logger.info("offline engine: unrecognised prompt, returning empty array")
     return "[]"
 
@@ -494,6 +498,153 @@ def _parse_cluster_prompt(prompt: str) -> list[dict[str, Any]]:
             except ValueError:
                 pass
     return clips
+
+
+
+# ----------------------------------------------------------------- post copy ---
+# Publishing metadata is derived from the transcript, not invented. Everything
+# here is extractive: a sentence the speaker actually said becomes the title and
+# description; tags are words that literally appear in the lines.
+_POST_SENTENCE_END = "。！？!?.;；\n"
+# Words that carry no topic. Tags built from these would be noise on a post.
+_EN_STOP = frozenset("""about after again against also because been before being between
+both could does doing down during each from further have having here into itself
+just like more most much must only other over same should some such than that the
+their them then there these they this those through under until very were what when
+where which while with would your you're it's don't didn't doesn't isn't aren't
+really going gonna want know think right okay yeah well thing things people""".split())
+_ZH_BAD_LEAD = frozenset("一二三四五六七八九十百千万亿几个每这那哪些个的了着过和与及或就都也还很更最把被从对向为以及是不没要能会可该得地之其")
+_ZH_STOP = frozenset("""这个 那个 我们 你们 他们 就是 然后 所以 但是 因为 如果 这样 那样 什么 怎么
+可以 一个 没有 知道 觉得 其实 现在 时候 东西 事情 真的 非常 应该 需要 可能 不是 这么 那么
+自己 大家 很多 一直 已经 还是 或者 而且 比如 这里 那里 的话 这种 那种""".split())
+_CJK = re.compile(r"[\u3400-\u9fff]")
+
+
+def _post_sentences(text: str) -> list[str]:
+    plain = re.sub(r"\s+", " ", re.sub(r">>+\s*", " ", str(text or ""))).strip()
+    parts, buffer = [], ""
+    for char in plain:
+        buffer += char
+        if char in _POST_SENTENCE_END:
+            if buffer.strip(_POST_SENTENCE_END + " "):
+                parts.append(buffer.strip())
+            buffer = ""
+    if buffer.strip():
+        parts.append(buffer.strip())
+    return [part for part in parts if len(part) >= 8]
+
+
+def _post_fit(text: str, limit: int) -> str:
+    """Cut to `limit` chars at a sentence or clause end, mirroring post_copy._fit."""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    cut = text[:limit]
+    best = max((cut.rfind(mark) for mark in "。！？!?.；;，, "), default=-1)
+    return (cut[:best + 1] if best >= limit * 0.6 else cut).rstrip("，,;； ").strip()
+
+
+def _post_tags(text: str, count: int, language: str) -> list[str]:
+    """Pick topic words that literally occur in the transcript.
+
+    Only repeated words are kept. A word the speaker returns to is the subject of
+    the clip; a word that appears once is usually a fragment, and a hashtag built
+    from a fragment is worse than one fewer hashtag.
+    """
+    if count <= 0 or not text.strip():
+        return []
+    picked: list[str] = []
+    if language == "en":
+        seen: set[str] = set()
+        counts: dict[str, int] = {}
+        for match in re.finditer(r"[A-Za-z][A-Za-z'-]{3,}", text):
+            word = match.group(0)
+            if word.lower() in _EN_STOP:
+                continue
+            counts[word] = counts.get(word, 0) + 1
+        for word, hits in sorted(counts.items(), key=lambda item: (-item[1], text.index(item[0]))):
+            if hits < 2 or len(picked) >= count:
+                continue
+            if word.lower() in seen or any(word.lower() in kept.lower() for kept in picked):
+                continue
+            seen.add(word.lower())
+            picked.append(word)
+        return picked
+
+    runs = re.findall(r"[\u3400-\u9fff]{2,}", text)
+    chosen: list[tuple[int, str]] = []
+    # Longest first, so "组织变革" wins over the "组织" fragment inside it.
+    for size in (5, 4, 3, 2):
+        for run in runs:
+            for start_at in range(0, len(run) - size + 1):
+                gram = run[start_at:start_at + size]
+                if gram in _ZH_STOP or len(chosen) >= count * 3:
+                    continue
+                # "一个业务"/"三十家" start mid-phrase: a classifier or numeral
+                # cannot begin a topic word, so drop the fragment.
+                if gram[0] in _ZH_BAD_LEAD:
+                    continue
+                if text.count(gram) < 2:
+                    continue
+                if any(gram in kept or kept in gram for _, kept in chosen):
+                    continue
+                chosen.append((start_at, gram))
+        if len(chosen) >= count:
+            break
+    ranked = sorted(chosen, key=lambda item: (-text.count(item[1]), -len(item[1]), item[0]))
+    for _, gram in ranked:
+        if len(picked) >= count:
+            break
+        picked.append(gram)
+    return picked
+
+
+def build_posts(payload: dict[str, Any]) -> dict[str, Any]:
+    """Per-platform title/description/tags for one clip, from the transcript."""
+    lines = str(payload.get("lines") or "")
+    title_hint = _salient(_clean(str(payload.get("title_hint") or "")), 60)
+    source = str(payload.get("source") or "").strip()
+    platforms = [str(p) for p in (payload.get("platforms") or []) if isinstance(p, str)]
+    rules = payload.get("rules") if isinstance(payload.get("rules"), dict) else {}
+
+    sentences = _post_sentences(lines)
+    # The opening sentence of a clip is the hook the renderer selected, so it is
+    # the honest first choice for a title; fall back to the model's own hint.
+    hook = _tidy(_clean(sentences[0])) if sentences else ""
+    body = " ".join(sentences[1:4]) if len(sentences) > 1 else ""
+    posts: dict[str, Any] = {}
+    for platform in platforms:
+        rule = rules.get(platform) if isinstance(rules.get(platform), dict) else {}
+        language = str(rule.get("language") or "zh")
+        title_max = int(rule.get("title_max") or 60)
+        description_max = int(rule.get("description_max") or 300)
+        tag_span = str(rule.get("tags") or "3-5")
+        low, _, high = tag_span.partition("-")
+        tag_max = int(high or low or 5)
+
+        chinese_platform = language != "en"
+        candidate = title_hint or hook
+        if chinese_platform and not _CJK.search(candidate):
+            candidate = hook or title_hint
+        if not chinese_platform:
+            english = hook or title_hint
+            # English platforms never accept a Chinese title (post_copy enforces
+            # this too); if the transcript has no English the field stays empty
+            # so the user fills it rather than shipping a wrong-language post.
+            candidate = english if not _CJK.search(english or "") else ""
+        title = _post_fit(candidate, title_max)
+
+        description = ""
+        if sentences:
+            description = " ".join(sentences[:3])
+            if source:
+                description = f"{description}（来源：{source}）"
+            description = _post_fit(description, description_max)
+
+        tags = _post_tags(lines, tag_max, language)
+        if platform == "xiaohongshu":
+            tags = [_post_fit(tag, 20) for tag in tags]
+        posts[platform] = {"title": title, "description": description, "tags": tags}
+    return {"posts": posts}
 
 
 # ------------------------------------------------------------------- server ---
@@ -570,17 +721,32 @@ class _Server:
     def __init__(self) -> None:
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        # Port may be assigned by the kernel, so the bound URL is remembered.
+        self.url: str = ""
 
     def start(self, host: str = LOCAL_HOST, port: int = DEFAULT_PORT) -> str:
         if self._httpd is not None:
-            return base_url()
-        httpd = ThreadingHTTPServer((host, port), _Handler)
+            return self.url
+        # A fixed port is a deployment hazard: two worker processes, a restarted
+        # instance that still holds the old socket, or a serverless sandbox
+        # shared between invocations all collide on 8100. Bind port 0 and read
+        # back what the kernel assigned; the caller uses the returned URL.
+        httpd = None
+        if port:
+            try:
+                httpd = ThreadingHTTPServer((host, port), _Handler)
+            except OSError:
+                logger.info("offline engine port %s busy, falling back to a free port", port)
+        if httpd is None:
+            httpd = ThreadingHTTPServer((host, 0), _Handler)
         httpd.daemon_threads = True
         self._httpd = httpd
+        bound = httpd.server_address[1]
+        self.url = f"http://{host}:{bound}/v1"
         self._thread = threading.Thread(target=httpd.serve_forever, name="offline-engine", daemon=True)
         self._thread.start()
-        logger.info("offline analysis engine listening on http://%s:%s/v1", host, port)
-        return base_url()
+        logger.info("offline analysis engine listening on %s", self.url)
+        return self.url
 
     def stop(self) -> None:
         if self._httpd is not None:
