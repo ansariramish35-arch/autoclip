@@ -1,0 +1,57 @@
+# AutoClip engine image for a single-container host (Railway / Render / Fly).
+#
+# The UI is served by Vercel, so this image skips the Node frontend build
+# entirely: same backend, same ffmpeg, roughly half the build time and none of
+# the ~430 npm packages. Start it with scripts/host-entrypoint.sh, which runs
+# Redis + the Celery worker + the API in one container.
+#
+#   docker build -f Dockerfile.host -t autoclip-engine .
+#   docker run -p 8000:8000 -e AUTOCLIP_OFFLINE_ENGINE=local autoclip-engine
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app
+
+# ffmpeg does the cutting, redis-server is the in-container Celery broker.
+# fonts-noto-cjk is required by the burned-in subtitle renderer.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    redis-server \
+    curl \
+    fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ ./backend/
+COPY scripts/ ./scripts/
+COPY init_database.py ./
+COPY docker-entrypoint.sh ./
+COPY scripts/host-entrypoint.sh ./
+
+# .env is optional at runtime; env.example is only a template, never a live config.
+RUN mkdir -p data/projects data/uploads data/temp data/output data/cache logs \
+    && chmod +x docker-entrypoint.sh scripts/host-entrypoint.sh \
+    && chmod -R 755 data logs
+
+# Run unprivileged: the API and worker only write inside /app.
+RUN groupadd -r autoclip && useradd -r -g autoclip -d /app autoclip \
+    && chown -R autoclip:autoclip /app
+USER autoclip
+
+EXPOSE 8000
+
+# Health start period is generous: the first boot initializes SQLite, starts
+# Redis and boots the worker before uvicorn binds.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT:-8000}/api/v1/health/" || exit 1
+
+ENTRYPOINT ["bash", "scripts/host-entrypoint.sh"]
