@@ -96,8 +96,8 @@ def _configure() -> None:
     os.environ.setdefault("ENVIRONMENT", "production")
     os.environ.setdefault("DEBUG", "false")
 
-    # The project root holds backend/, prompt/, and assets/ that the app reads
-    # relative to its package; make it importable regardless of the cwd.
+    # The project root holds backend/ and prompt/, which the app reads relative
+    # to its package; make it importable regardless of the cwd.
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 

@@ -163,3 +163,9 @@ control/
 # Static ffmpeg/ffprobe for the serverless build (157 MB). Fetched by
 # scripts/fetch-ffmpeg.sh during the Vercel build, never committed.
 vendor/ffmpeg/
+
+# Vercel build staging (copies of backend/prompt/assets + ffmpeg).
+frontend/api/backend/
+frontend/api/prompt/
+frontend/api/assets/
+frontend/api/vendor/
