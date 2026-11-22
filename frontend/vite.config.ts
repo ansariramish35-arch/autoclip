@@ -18,7 +18,17 @@ export default defineConfig(({ mode, command }) => {
   if (uploadSourceMaps && !authToken) {
     throw new Error('SENTRY_AUTH_TOKEN is required when SENTRY_UPLOAD_SOURCEMAPS=true')
   }
-  const desktopVersion = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8')).version
+  // The desktop shell is not part of a web deployment, and .vercelignore keeps
+  // it out of the build, so its version file may be absent. VITE_APP_VERSION
+  // (or a fallback) must not make the web build depend on a desktop artifact.
+  const readDesktopVersion = (): string => {
+    try {
+      return JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8')).version
+    } catch {
+      return '0.0.0'
+    }
+  }
+  const desktopVersion = readDesktopVersion()
   const appVersion = env.VITE_APP_VERSION || desktopVersion
   // Dev-only: when the dev server is reached through a proxy that rewrites Host
   // (e.g. a container or cloud live-preview domain), Vite's host allowlist would
