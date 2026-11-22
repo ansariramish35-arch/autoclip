@@ -56,6 +56,33 @@ never overwrites an existing settings file, so your configuration stays.
 
 ---
 
+## 0. Fastest path: run it in this workspace (works right now)
+
+The sandbox already runs the full stack — API, Celery worker, Redis, ffmpeg,
+ffprobe — with the key-free engine on. Nothing to deploy, no keys, no card:
+
+**https://3000-i2gb7q8gqa9njzdfg2an5.e2b.app**
+
+Enable the engine in the sandbox (one line, then restart the backend):
+
+```bash
+echo 'AUTOCLIP_OFFLINE_ENGINE=local' >> .env
+# restart the API so it picks the flag up; the settings file self-seeds
+```
+
+Then `curl localhost:8000/api/v1/studio/readiness` must say
+`"ready": true` with `analysis: configured`.
+
+Verified on 2026-11-22 by importing a real video through
+`POST /api/v1/studio/import`: 5 drafts selected, **4 clips rendered at
+1080x1920** (38 s, 62 s, 70 s, 63 s) with burned-in captions. That is the same
+endpoint the "Generate videos" button calls, so the button works once the
+engine flag is on and ffprobe is present.
+
+> **Why the hosted Vercel URL is not this:** a browser tab cannot reach this
+> sandbox, and the Vercel frontend has no engine of its own. Only a container
+> host (step 1) gives the hosted URL something to call.
+
 ## 1. Deploy the engine (container host)
 
 The image is the repo's own `Dockerfile`, started with
