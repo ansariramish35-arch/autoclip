@@ -120,31 +120,42 @@ Created and deployed:
 Until step 1 is done, the app loads but every API call fails — that is the
 frontend waiting for an engine.
 
-Point it at the engine — use `/api/:path*` as a **rewrite**, not an environment
-variable. Rewrites keep the browser on one origin, so the backend's origin guard
-sees the same `Host` on reads and writes and no CORS or allowlist is involved:
+Point it at the engine by setting **one environment variable** — no file edit:
 
-`frontend/vercel.json`
+> Vercel → project `autoclip` → Settings → **Environment Variables** →
+> `AUTOCLIP_API_ORIGIN` = `https://YOUR-ENGINE-HOST` (no trailing slash) →
+> all environments → **Redeploy**.
 
-```json
-{
-  "rewrites": [
-    { "source": "/api/:path*", "destination": "https://YOUR-ENGINE-HOST/api/:path*" },
-    { "source": "/((?!assets/).*)", "destination": "/index.html" }
-  ]
-}
-```
+`frontend/middleware.ts` proxies `/api/:path*` to it at request time, so the
+browser only ever talks to one origin. That matters because
+`backend/core/local_origin_guard.py` accepts a write only when the request's
+`Origin` matches the `Host` the backend sees; the proxy forwards the browser's
+own `Host` in `X-Forwarded-Host`, so writes (create / import / delete) pass with
+no origin allowlist and no CORS preflight.
 
-Commit and push; Vercel redeploys. Then open the Vercel URL and import a video.
+It is middleware rather than a `vercel.json` rewrite on purpose: rewrite
+destinations are static JSON, so changing the engine host would mean editing and
+pushing a file. A middleware reads the variable at runtime.
 
-Everything the rewrite sends arrives with the browser's own `Host`, which is what
-`backend/core/local_origin_guard.py` compares against — so writes (create/import/
-delete) pass with no origin allowlist, and there is no CORS preflight at all.
+### If it is not configured
 
-> Prefer a direct connection instead of a proxy? Set the build variable
-> `VITE_API_BASE_URL=https://YOUR-ENGINE-HOST` **and** the engine variable
-> `AUTOCLIP_ALLOWED_ORIGINS=https://YOUR-PROJECT.vercel.app`. The proxy is
-> simpler and is what the checked-in config does.
+`/api/*` answers `503 {"error_code":"engine_not_configured"}` and the UI says
+*"Not connected to the AutoClip engine yet: set the engine address in your
+deployment settings and try again."*
+
+If the engine is chosen but down, you get `502 {"error_code":"engine_unreachable"}`
+(*"Cannot reach the AutoClip engine — check that the container is running."*)
+
+Before this proxy existed, a `POST /api/...` fell through the SPA catch-all and
+static hosting rejected it as **405** — the "Request failed with status code 405"
+banner. Any bare 405 on an `/api` call now means the middleware did not run.
+
+### Why not call the engine directly
+
+You can, with `VITE_API_BASE_URL=https://YOUR-ENGINE-HOST` as a build variable —
+but then you also need `AUTOCLIP_ALLOWED_ORIGINS=https://YOUR-PROJECT.vercel.app`
+on the engine, every write gets a CORS preflight, and any URL change needs a
+rebuild. The proxy is the simpler contract and is what is deployed.
 
 ## 3. Use it
 

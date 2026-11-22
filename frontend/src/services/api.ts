@@ -189,6 +189,11 @@ api.interceptors.response.use(
     else if (error.response?.status >= 500) {
       error.userMessage = t("服务器内部错误，请稍后重试")
     }
+    // 405 on an /api call means no engine proxy answered and the request reached
+    // static hosting. Say that, instead of surfacing axios's bare status code.
+    else if (error.response?.status === 405 && String(error.config?.url || '').includes('/api/')) {
+      error.userMessage = t("尚未连接 AutoClip 引擎：请在部署配置中设置引擎地址后重试")
+    }
     
     return Promise.reject(error)
   }
