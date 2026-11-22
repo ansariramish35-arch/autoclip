@@ -98,10 +98,27 @@ curl https://YOUR-ENGINE-HOST/api/v1/studio/readiness
 `readiness` must report `"ready": true` with `analysis: configured`. If it says
 `missing` for ffmpeg, the image was built without the runtime stage.
 
-## 2. Deploy the frontend (Vercel)
+## 2. Deploy the frontend (Vercel) — already done
 
-The Vercel project `autoclip` already exists and builds `frontend/` (Vite), with
-`frontend/vercel.json` adding the SPA rewrite that React Router needs.
+Created and deployed:
+
+| | |
+|---|---|
+| Project | `autoclip` (`prj_rHBJnM02CoyGq5CQdRM4YpTRr066`), team `ansariramish35-arch` |
+| Root directory | `frontend` (framework: Vite, output `dist`) |
+| Git | `ansariramish35-arch/autoclip`, auto-deploys on push |
+| **Production URL** | **https://autoclip-ansariramish35-arch.vercel.app** |
+
+`frontend/vercel.json` supplies the SPA rewrite that React Router needs.
+
+> **One toggle needed:** the project has Vercel *Deployment Protection*
+> ("Vercel Authentication") on, so anyone not signed in to your Vercel account
+> gets a login page instead of the app. To share the URL:
+> Project → Settings → **Deployment Protection** → *Vercel Authentication* →
+> **Disabled** → Save. Your own browser works either way.
+
+Until step 1 is done, the app loads but every API call fails — that is the
+frontend waiting for an engine.
 
 Point it at the engine — use `/api/:path*` as a **rewrite**, not an environment
 variable. Rewrites keep the browser on one origin, so the backend's origin guard
@@ -119,6 +136,10 @@ sees the same `Host` on reads and writes and no CORS or allowlist is involved:
 ```
 
 Commit and push; Vercel redeploys. Then open the Vercel URL and import a video.
+
+Everything the rewrite sends arrives with the browser's own `Host`, which is what
+`backend/core/local_origin_guard.py` compares against — so writes (create/import/
+delete) pass with no origin allowlist, and there is no CORS preflight at all.
 
 > Prefer a direct connection instead of a proxy? Set the build variable
 > `VITE_API_BASE_URL=https://YOUR-ENGINE-HOST` **and** the engine variable
