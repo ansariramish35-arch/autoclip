@@ -16,6 +16,9 @@ const CODE = ts.transpileModule(SOURCE, {
 /** Minimal Next primitives: NextResponse is a Response with JSON helpers. */
 function nextRuntime() {
   class NextResponse extends Response {
+    static next() {
+      return new NextResponse(null, { status: 200, headers: { 'x-middleware-next': '1' } })
+    }
     static json(body, init) {
       return new NextResponse(JSON.stringify(body), {
         ...init,
@@ -121,16 +124,25 @@ test('hop-by-hop headers are not forwarded', async () => {
   }
 })
 
-test('an unset engine origin answers 503 with a readable code, not a bare 405', async () => {
+test('an unset engine origin yields to the app instead of shadowing it', async () => {
+  // The host may serve /api/* itself: on Vercel the API is a Python function in
+  // this same project (frontend/api/index.py). Answering 503 here would shadow
+  // that function and make every page inert, which is exactly what a deployment
+  // looked like before this was fixed.
   for (const origin of [undefined, '', '   ']) {
     const { middleware, calls, makeRequest } = load({ origin })
     const response = await middleware(makeRequest('https://app.example.com/api/v1/health/', { method: 'POST' }))
-    assert.equal(response.status, 503)
-    const body = await response.json()
-    assert.equal(body.error_code, 'engine_not_configured')
-    assert.ok(body.detail.length > 0)
+    assert.equal(response.status, 200, 'the request must be passed through')
+    assert.equal(response.headers.get('x-middleware-next'), '1')
     assert.equal(calls.length, 0, 'nothing may be fetched without a target')
   }
+})
+
+test('a configured engine still wins over the app route', async () => {
+  const { middleware, calls, makeRequest } = load({ origin: 'https://engine.example.com' })
+  await middleware(makeRequest('https://app.example.com/api/v1/health/', { method: 'GET' }))
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, 'https://engine.example.com/api/v1/health/')
 })
 
 test('a trailing slash on the configured origin does not double up', async () => {

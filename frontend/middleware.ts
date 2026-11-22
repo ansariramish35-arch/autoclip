@@ -54,7 +54,11 @@ function notConfigured(): NextResponse {
 }
 
 export default async function middleware(request: NextRequest): Promise<Response> {
-  if (!TARGET) return notConfigured()
+  // No external engine configured: continue to the app's own route handlers.
+  // On a deployment where the API is itself a function in this project
+  // (frontend/api/index.py), /api/* must reach it. Returning 503 here would
+  // shadow that function and make the whole site inert.
+  if (!TARGET) return NextResponse.next()
 
   const target = new URL(`${TARGET}${request.nextUrl.pathname}${request.nextUrl.search}`)
 
