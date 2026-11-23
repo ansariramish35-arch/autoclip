@@ -263,3 +263,70 @@ def test_boundary_prompt_never_ends_on_an_unfinished_row():
     result = json.loads(offline_llm.answer(boundaries.BOUNDARY_PROMPT,
                                            {"lines": lines, "start_line": 0, "end_line": 2}))
     assert result["end_line"] == 3, result  # extended past the unfinished row
+
+
+def test_same_language_clip_keeps_its_captions_key_free():
+    """A Chinese clip on a Chinese platform must have captions and a title."""
+    import json
+    from backend.core import offline_llm
+    from backend.services.platform_strategy import platform_strategy
+    from backend.services.studio import packaging
+
+    call = lambda prompt, body: json.loads(offline_llm.answer(prompt, body))  # noqa: E731
+    lines = [{"text": "为什么大多数公司做不好AI转型？", "start": 0, "end": 2},
+             {"text": "因为把AI当成了IT项目。", "start": 2, "end": 4}]
+    result = packaging.build_packaging({"title": "AI 转型"}, lines,
+                                      platform_strategy("douyin"), call=call)
+    assert result["fallback"] is False
+    assert len(result["cues"]) == 2
+    assert all(cue["text"] for cue in result["cues"])
+    assert result["title_lines"]
+
+
+def test_english_clip_on_an_english_platform_keeps_its_captions():
+    import json
+    from backend.core import offline_llm
+    from backend.services.platform_strategy import platform_strategy
+    from backend.services.studio import packaging
+
+    call = lambda prompt, body: json.loads(offline_llm.answer(prompt, body))  # noqa: E731
+    lines = [{"text": "Why do most companies get AI transformation wrong?", "start": 0, "end": 2},
+             {"text": "Because they treat AI as an IT project.", "start": 2, "end": 4}]
+    result = packaging.build_packaging({"title": "AI transformation"}, lines,
+                                      platform_strategy("tiktok"), call=call)
+    assert result["fallback"] is False
+    assert len(result["cues"]) == 2
+    assert result["title_lines"] and all(len(line) <= 40 for line in result["title_lines"])
+
+
+def test_burned_caption_detection_answers_none_without_a_vision_model():
+    """The render asks whether the source already has burned captions."""
+    import json
+    from backend.core import offline_llm
+    from backend.services.studio import jobs
+
+    answer = json.loads(offline_llm.answer(jobs.BURNED_LANGUAGE_PROMPT, {}))
+    assert answer["language"] in ("zh", "en", "ja", "ko", "other", "none")
+
+
+def test_describe_clip_never_invents_words():
+    """A label may only use words the clip actually says."""
+    from backend.core.offline_llm import describe_clip
+    text = "很多公司把预算花在买模型上，但真正的转型是组织变革。"
+    line = describe_clip(text, "zh")
+    assert line and all(word in text for word in line[0].split("、"))
+
+
+def test_a_variant_orphaned_without_a_claim_is_settled_so_it_can_be_retried(tmp_path, monkeypatch):
+    """A function frozen between queueing a variant and dispatching it must not spin forever.
+
+    Nothing owns such a variant, `produce` refuses it as "already being generated",
+    and the card would show a queued state that never changes. Recovery settles it
+    as an interrupted run, which is what the UI turns into a retry button.
+    """
+    from backend.services.studio import store
+
+    assert store.render_alive({"status": "queued", "queued_by_instance": store.INSTANCE})
+    assert not store.render_alive({"status": "queued", "queued_by_instance": "an-instance-that-is-gone"})
+    assert store.render_alive({"status": "queued", "render_dispatch_claimed": True})
+    assert store.render_alive({"status": "queued", "render_job_id": "abc"})

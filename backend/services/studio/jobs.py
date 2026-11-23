@@ -1577,6 +1577,9 @@ def _initial_derive(project_id, plan, video, generation, platforms, branding, sk
             'id': uuid.uuid4().hex, 'draft_id': draft.id, 'draft_revision': draft.revision,
             'strategy_id': strategy_id, 'strategy_version': 1, 'branding': branding,
             'status': 'queued' if now else 'on_demand', 'created_at': store.now(),
+            # Which instance queued it: a queued variant with no claim and no job from another
+            # instance is an orphan (store.recover settles it so the UI can retry).
+            **({'queued_by_instance': store.INSTANCE} if now else {}),
             **({SCORE_KEY: scores[source_id]} if source_id in scores else {}),
             **({'trimmed_to_sec': trimmed} if trimmed else {}),
             **({'framing': framed} if framed else {}),

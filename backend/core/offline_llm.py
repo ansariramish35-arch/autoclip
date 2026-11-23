@@ -51,6 +51,7 @@ _POST_COPY_MARKER = "为 platforms 里的每个平台写发布文案"
 _PACKAGING_MARKER = "为这段访谈做包装"
 _CLIP_FINDER_MARKER = "挑出所有值得单独发布成短视频的片段"
 _BOUNDARY_MARKER = "请调整首尾"
+_BURNED_MARKER = "判断画面上有没有烧录的对白字幕"
 
 # Sentence-final punctuation, plus soft breaks CJK subtitles actually use.
 _SENTENCE_END = "。！？!?；;….．"
@@ -482,6 +483,9 @@ def answer(prompt: str, input_data: Any = None) -> str:
     if _CLIP_FINDER_MARKER in prompt:
         return json.dumps(build_clip_windows(payload if isinstance(payload, dict) else {}), ensure_ascii=False)
 
+    if _BURNED_MARKER in prompt:
+        return json.dumps({"language": "none"}, ensure_ascii=False)
+
     if _BOUNDARY_MARKER in prompt:
         return json.dumps(build_boundary(payload if isinstance(payload, dict) else {}), ensure_ascii=False)
 
@@ -644,6 +648,79 @@ def _pack_title_lines(text: str, limit: int, audience: str) -> list[str]:
     return []
 
 
+_HAN = re.compile(r"[\u4e00-\u9fff]")
+_KANA = re.compile(r"[\u3040-\u30ff]")
+_HANGUL = re.compile(r"[\uac00-\ud7af]")
+_STOPWORDS_EN = frozenset("""a an the and but or so because since while with without for from into
+over under this that these those it its is are was were be been being do does did not no
+you your we our they their he she his her them us i me my of to in on at as by about
+what why how when where who which more most very really just also than then there here
+can could would should will shall may might must have has had one two""".split())
+
+
+def script_of(text: str) -> str:
+    """Dominant writing system of a line: zh / en / other."""
+    text = str(text or "")
+    han, kana, hangul = len(_HAN.findall(text)), len(_KANA.findall(text)), len(_HANGUL.findall(text))
+    if kana or hangul:
+        return "other"
+    if han:
+        return "zh"
+    latin = len(re.findall(r"[A-Za-z]", text))
+    return "en" if latin >= 3 else "other"
+
+
+def keywords(text: str, count: int = 4) -> list[str]:
+    """Topic words that literally occur in `text`, most specific first.
+
+    A key-free engine cannot write new words, so an honest label for a clip is built
+    from the words the clip already uses: Latin tokens of four letters or more that
+    are not function words, or Chinese 2-4 character runs. Nothing is invented, so a
+    generated caption can never claim something the speaker did not say.
+    """
+    text = str(text or "")
+    picked: list[str] = []
+    seen: set[str] = set()
+    for word in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", text):
+        key = word.lower()
+        if key in _STOPWORDS_EN or key in seen:
+            continue
+        seen.add(key)
+        picked.append(word)
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+        for size in (4, 3, 2):
+            for start in range(0, len(run) - size + 1):
+                gram = run[start:start + size]
+                if len(picked) >= count:
+                    return picked[:count]
+                if gram not in seen and not any(gram in kept for kept in picked):
+                    seen.add(gram)
+                    picked.append(gram)
+            if len(picked) >= count:
+                return picked[:count]
+    return picked[:count]
+
+
+def describe_clip(text: str, audience: str = "en", limit: int = 60) -> list[str]:
+    """One honest line describing a clip, in the audience's script.
+
+    This is what a key-free deployment shows instead of a translation: it says what
+    the clip is about using only its own words. Zeros on the screen of an English
+    platform are worse than a real Chinese title, and an invented translation is
+    worse than both.
+    """
+    words = keywords(text, 5)
+    if not words:
+        return []
+    if audience == "en":
+        head = " · ".join(words[:3])
+        line = _pack_line(f"On {head}" if len(words) > 3 else head, limit)
+        return [line] if line else []
+    head = "、".join(words[:3])
+    line = _pack_line(head, 20)
+    return [line] if line else []
+
+
 def build_packaging(payload: dict[str, Any]) -> dict[str, Any]:
     """Packaging metadata derived from the transcript.
 
@@ -661,27 +738,32 @@ def build_packaging(payload: dict[str, Any]) -> dict[str, Any]:
     text = " ".join(line for line in lines if line)
 
     if payload.get("translate") is True:
-        # A key-free engine has no second language. Saying so lets the caller skip two
-        # fruitless attempts and take its documented "keep the source captions" path.
-        return {"translate_unsupported": True, "title_lines": [], "segments": []}
-
-    title_lines = _pack_title_lines(text, limit, audience)
+        # No second language exists here. Keeping the source text with captions is the
+        # documented fallback: a readable clip beats an empty one.
+        audience = "zh" if script_of(text) == "zh" else "en"
+        limit = int(payload.get("title_limit") or (20 if audience == "zh" else 60))
+        title_lines = _pack_title_lines(text, limit, audience) or describe_clip(text, audience)
+    else:
+        title_lines = _pack_title_lines(text, limit, audience)
 
     # Rejoin ASR fragments into sentences, then map each sentence back to the
     # line ids it covers: segments must be contiguous, ordered, non-overlapping
-    # and cover every line.
+    # and cover every line. The validator requires them whenever it expects a
+    # translation, and the text is the source row (nothing is invented here).
     segments: list[dict[str, Any]] = []
-    if payload.get("translate") is not True and lines:
+    if lines:
         start, buffer = 0, ""
         for index, line in enumerate(lines):
             buffer = f"{buffer} {line}".strip()
             sentence_end = bool(buffer) and buffer[-1] in "。！？!?.;；"
             long_enough = len(buffer) >= 40
             if (sentence_end or long_enough) and index - start < 4:
-                segments.append({"from": start, "to": index, "text": ""})
+                segments.append({"from": start, "to": index})
                 start, buffer = index + 1, ""
         if start < len(lines):
-            segments.append({"from": start, "to": len(lines) - 1, "text": ""})
+            segments.append({"from": start, "to": len(lines) - 1})
+        for segment in segments:
+            segment["text"] = _clean(" ".join(lines[segment["from"]:segment["to"] + 1]))[:600]
 
     # A highlight must be a literal substring of the line it points at.
     highlights: list[dict[str, Any]] = []

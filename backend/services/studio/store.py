@@ -153,6 +153,22 @@ def variant_identity(variant):
                  ('id', 'draft_id', 'draft_revision', 'preparation_run_id', 'render_attempt_id'))
 
 
+def render_alive(variant) -> bool:
+    """Whether something could still turn this queued variant into a render.
+
+    A variant this process just queued has nothing to claim until dispatch runs
+    here, and that is fine. Anything else — a queued variant from an earlier
+    instance with no job and no claim — has no owner, and must not be reported as
+    "still working".
+    """
+    if variant.get('render_job_id'):
+        return True
+    if variant.get('render_dispatch_claimed'):
+        return True
+    owner = variant.get('queued_by_instance')
+    return not owner or owner == INSTANCE
+
+
 def claim_render(data, expected):
     variant = next((row for row in data['output_variants'] if row['id'] == expected[0]), None)
     if not variant or variant_identity(variant) != expected or variant.get('status') != 'queued' or variant.get('render_job_id') or variant.get('render_dispatch_claimed'):
@@ -504,6 +520,15 @@ def recover(project_id: str):
             variant.pop('render_dispatch_claimed', None)
             variant.pop('render_dispatch_instance', None)
             abandoned_claim = True
+            settle = True
+        elif (variant.get('status') == 'queued' and not variant.get('render_job_id') and not render_alive(variant)):
+            # Queued, never claimed, and nothing is left to claim it. On a server a retry could
+            # still pick it up, but the reader cannot know that: if the dispatch that would have
+            # claimed it is gone (a function instance frozen between creating the variants and
+            # dispatching them, or a worker that died mid-dispatch), the card would spin forever
+            # and `produce` would refuse it as "already being generated". Settle it as an
+            # interrupted run so the UI offers its own retry, which re-arms the variant.
+            variant.update(status='failed', error=RESTART_MESSAGE, error_code=RESTART_CODE, needs_prepare=True)
             settle = True
         elif variant.get('status') == 'preparing' and variant.get('instance') != INSTANCE:
             variant.update(status='failed', error=RESTART_MESSAGE, error_code=RESTART_CODE, needs_prepare=True)
