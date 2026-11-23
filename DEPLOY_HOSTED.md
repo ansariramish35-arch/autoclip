@@ -1,39 +1,59 @@
-# AutoClip — hosted, no API keys
+# AutoClip — hosted on Vercel, no API keys
 
-This deployment needs **no API keys and no model download**. You get the real
-AutoClip pipeline (ffmpeg cuts, real clips, Celery, the app's own five analysis
-prompts and parsers) with a deterministic analysis engine that runs inside the
-backend.
+The **whole app runs on Vercel**: the React build and the FastAPI engine, as one
+Python function. No API keys, no model download, no container host, no database
+to provision. Import a video (or a link), and you get real rendered clips.
 
-There are two pieces:
-
-| Piece | Host | What it does |
+| Piece | Where | What it does |
 |---|---|---|
-| Web app | **Vercel** | The React build. Proxies every API call to the engine. |
-| Engine | **A container host** | FastAPI + Celery + Redis + ffmpeg. Does the actual work. |
+| Web app | Vercel static + CDN | The React build |
+| Engine | Vercel Python function (`frontend/api/index.py`) | FastAPI, ffmpeg, the five analysis prompts, rendering |
+| Analysis model | in-process, same function | `backend/core/offline_llm.py` (deterministic, key-free) |
 
-Vercel alone cannot do the second job: serverless functions have no ffmpeg, a
-300 s ceiling, and no long-lived worker to render 90-minute videos. That is why
-the engine lives on a container host and Vercel talks to it.
+Production URL: **https://autoclip-gules.vercel.app**
 
----
+Vercel's Python function has no system ffmpeg, so the build ships a static
+ffmpeg/ffprobe inside the bundle (`scripts/vercel-build.sh`, 150 MB) and the whole
+function measures ~474 MB against the 500 MB Python limit. Do not add packages to
+`frontend/requirements.txt` without checking `du -sm` afterwards.
+
+## What a hosted function changes (and how it is handled)
+
+| Limitation | Handling |
+|---|---|
+| Only `/tmp` is writable | `api/index.py` points `AUTOCLIP_DATA_DIR` and `DATABASE_URL` at `/tmp/autoclip` |
+| Everything freezes when the response is sent | the ASGI app is wrapped in `_DrainAfterResponse`, which keeps the invocation alive until the render work it started has finished (280 s budget, under the 300 s cap) |
+| No Redis | the studio pipeline runs on a `ThreadPoolExecutor`; progress falls back to SQLite |
+| No system ffmpeg | static binaries inside the bundle, pathed by `AUTOCLIP_FFMPEG_PATH` / `AUTOCLIP_FFPROBE_PATH` |
+| Request body capped at 4.5 MB | the UI explains it before uploading and points at the link import; `VITE_UPLOAD_LIMIT_MB` is set by the Vercel build only, so a self-hosted API keeps unlimited uploads |
+| No Whisper in the bundle | import a video link (YouTube / Bilibili, yt-dlp ships in the function) or attach a `.srt` next to the file |
+
+**What fits in one invocation:** a 90 s source, 3 platforms → 9 clips, all
+rendered in ~180 s (measured on the production build). One to three platforms on a
+one- to two-minute source is the comfortable range; very long sources belong on a
+container host (§5).
 
 ## How "no API keys" works
 
 Normally AutoClip stops at the import gate and asks for an LLM key. This build
-replaces that with a local child process:
+starts a local OpenAI-compatible endpoint inside the function instead:
 
 ```
 backend/core/offline_llm.py        OpenAI-compatible /v1/chat/completions
 backend/core/offline_bootstrap.py  starts it + seeds the model settings
 ```
 
-`AUTOCLIP_OFFLINE_ENGINE=local` turns it on. On startup the backend:
+`AUTOCLIP_OFFLINE_ENGINE=local` turns it on (the entrypoint sets it by default).
+On startup the backend:
 
-1. listens on `127.0.0.1:8100/v1` (OpenAI wire format, no auth);
+1. binds a free port on `127.0.0.1` (8100 when free) and serves the OpenAI wire
+   format with no auth;
 2. writes `data/ai-model-settings.json` with an `ollama`-shaped connection
    pointing at it. `ollama` is one of the app's *local presets*, which route to
-   `openai` + `base_url` and are considered ready with **no key at all**;
+   `openai` + `base_url` and are ready with **no key at all**. On every later
+   start it rewrites only that connection's URL to the port bound this time — a
+   stale port from a previous instance is why analysis would otherwise fail with
+   `connection`;
 3. sets subtitle analysis mode (no Whisper download, no ASR billing) and a
    `0.55` score threshold, because the deterministic scorer runs lower than a
    chat model would.
@@ -48,42 +68,69 @@ The five steps are answered from the subtitle text itself:
 | 4 | `标题生成.txt` | Picks the most nameable sentence, strips "um/so/I mean" openers |
 | 5 | `主题聚类.txt` | Groups clips sharing vocabulary; only groups of 2+ |
 
-It is deterministic, not clever. It reliably finds well-formed, information-dense
-stretches; it cannot understand nuance the way a real model can.
+It also answers the prompts the studio layer sends, which is what makes the
+output look finished rather than merely cut:
+
+| Prompt | Answer |
+|---|---|
+| clip finder | complete-answer windows with Chinese titles, a reason and a score |
+| boundaries | moves a cut off a half sentence, never starts on a continuation row |
+| packaging | 1–2 title lines wrapped by the caption layout code (never mid-word), sentence segments, per-line emphasis that is a literal substring, tags, a mood that picks palette and style |
+| post copy | title, description and tags from the clip's own words |
+| burned-caption check | `none` (no vision model, so nothing is claimed) |
+
+It is deterministic, not clever. It reliably finds well-formed,
+information-dense stretches; it cannot understand nuance the way a real model
+can. It also cannot translate: a clip on a platform with a different audience
+language keeps its source captions rather than inventing a translation.
 
 **Want a real model instead?** Open Settings and add your own provider. The seed
-never overwrites an existing settings file, so your configuration stays.
+never overwrites an existing settings file; only its own connection is re-pointed.
 
 ---
 
-## 0. Fastest path: run it in this workspace (works right now)
+## 1. Deploy
 
-The sandbox already runs the full stack — API, Celery worker, Redis, ffmpeg,
-ffprobe — with the key-free engine on. Nothing to deploy, no keys, no card:
-
-**https://3000-i2gb7q8gqa9njzdfg2an5.e2b.app**
-
-Enable the engine in the sandbox (one line, then restart the backend):
+The project is already created (`autoclip`, root directory `frontend`, framework
+`vite`). To deploy the current branch:
 
 ```bash
-echo 'AUTOCLIP_OFFLINE_ENGINE=local' >> .env
-# restart the API so it picks the flag up; the settings file self-seeds
+# in the repo
+git push origin arena/7fc10a83-autoclip
 ```
 
-Then `curl localhost:8000/api/v1/studio/readiness` must say
-`"ready": true` with `analysis: configured`.
+then either push to the project's production branch, or create a deployment for
+that branch (this is what the connector does), and wait for **READY / PROMOTED**.
 
-Verified on 2026-11-22 by importing a real video through
-`POST /api/v1/studio/import`: 5 drafts selected, **4 clips rendered at
-1080x1920** (38 s, 62 s, 70 s, 63 s) with burned-in captions. That is the same
-endpoint the "Generate videos" button calls, so the button works once the
-engine flag is on and ffprobe is present.
+Project settings that matter (all live in `frontend/vercel.json` plus the project):
 
-> **Why the hosted Vercel URL is not this:** a browser tab cannot reach this
-> sandbox, and the Vercel frontend has no engine of its own. Only a container
-> host (step 1) gives the hosted URL something to call.
+| Setting | Value |
+|---|---|
+| Root Directory | `frontend` |
+| Framework | `vite` |
+| Build Command | `bash ../scripts/vercel-build.sh` |
+| Install Command | `npm ci` |
+| Output Directory | `dist` |
+| Function | `api/index.py`, `maxDuration` 300, `memory` 2000 |
+| Environment variables | **none required** |
 
-## 1. Deploy the engine (container host)
+`AUTOCLIP_API_ORIGIN` must stay **unset**: when it is set, `frontend/middleware.ts`
+proxies `/api/*` to that origin instead of this project's own function. With it
+unset, the middleware passes through and the function serves the API.
+
+### Deployment Protection (why the URL may ask you to log in)
+
+The project has `ssoProtection: all_except_custom_domains`, so a `*.vercel.app`
+URL redirects a browser to a Vercel login — that is Vercel's default for team
+projects, not a fault in the app. Two ways out:
+
+- turn Protection off: Vercel → Project → Settings → Deployment Protection → Vercel
+  Authentication → **Disabled**; or
+- attach a custom domain, which is exempt from that rule by default.
+
+---
+
+## 5. Container host (for very long sources)
 
 The image is the repo's own `Dockerfile`, started with
 `scripts/host-entrypoint.sh`, which runs Redis, the Celery worker and the API in
@@ -125,86 +172,69 @@ curl https://YOUR-ENGINE-HOST/api/v1/studio/readiness
 `readiness` must report `"ready": true` with `analysis: configured`. If it says
 `missing` for ffmpeg, the image was built without the runtime stage.
 
-## 2. Deploy the frontend (Vercel) — already done
+## 2. Use it
 
-Created and deployed:
+1. Open the production URL.
+2. **Import a video**: paste a YouTube / Bilibili link, or upload a file with its
+   `.srt` (see the 4.5 MB note above). The link route needs no upload at all.
+3. Pick platforms (一 to three is the comfortable range) and press generate.
+4. The clips render inside the same request chain; when the cards flip to
+   completed, play or download them. Each clip is 1080×1920 H.264 + AAC with the
+   title, captions and post copy the packaging step produced.
 
-| | |
-|---|---|
-| Project | `autoclip` (`prj_rHBJnM02CoyGq5CQdRM4YpTRr066`), team `ansariramish35-arch` |
-| Root directory | `frontend` (framework: Vite, output `dist`) |
-| Git | `ansariramish35-arch/autoclip`, auto-deploys on push |
-| **Production URL** | **https://autoclip-ansariramish35-arch.vercel.app** |
+No settings, no keys, no sign-in (from the app's point of view).
 
-`frontend/vercel.json` supplies the SPA rewrite that React Router needs.
+## 3. Verify the deployment end to end
 
-> **One toggle needed:** the project has Vercel *Deployment Protection*
-> ("Vercel Authentication") on, so anyone not signed in to your Vercel account
-> gets a login page instead of the app. To share the URL:
-> Project → Settings → **Deployment Protection** → *Vercel Authentication* →
-> **Disabled** → Save. Your own browser works either way.
+```bash
+# readiness: needs ready=true and analysis=configured
+curl -s https://autoclip-gules.vercel.app/api/v1/studio/readiness
 
-Until step 1 is done, the app loads but every API call fails — that is the
-frontend waiting for an engine.
+# import a link (no upload, so no body limit) and watch it
+curl -s -X POST https://autoclip-gules.vercel.app/api/v1/studio/import \
+  -F 'url=https://www.youtube.com/watch?v=...' -F 'platforms=douyin' \
+  -F 'goal=content' -F 'auto_start=true'
 
-Point it at the engine by setting **one environment variable** — no file edit:
+# then poll until generation.status is completed, and download
+curl -s https://autoclip-gules.vercel.app/api/v1/studio/<project_id>
+curl -o clip.mp4 https://autoclip-gules.vercel.app/api/v1/studio/<project_id>/exports/<job_id>/video
+```
 
-> Vercel → project `autoclip` → Settings → **Environment Variables** →
-> `AUTOCLIP_API_ORIGIN` = `https://YOUR-ENGINE-HOST` (no trailing slash) →
-> all environments → **Redeploy**.
+A `200` from `/import` on its own proves nothing — the response is sent before the
+rendering finishes. `generation.status: completed` plus a playable mp4 is the
+pass condition.
 
-`frontend/middleware.ts` proxies `/api/:path*` to it at request time, so the
-browser only ever talks to one origin. That matters because
-`backend/core/local_origin_guard.py` accepts a write only when the request's
-`Origin` matches the `Host` the backend sees; the proxy forwards the browser's
-own `Host` in `X-Forwarded-Host`, so writes (create / import / delete) pass with
-no origin allowlist and no CORS preflight.
+## 4. Deploying changes
 
-It is middleware rather than a `vercel.json` rewrite on purpose: rewrite
-destinations are static JSON, so changing the engine host would mean editing and
-pushing a file. A middleware reads the variable at runtime.
+`frontend/api/index.py` is the ASGI app; `frontend/requirements.txt` is the
+function's dependency list; `scripts/vercel-build.sh` stages the function tree,
+fetches ffmpeg and builds the frontend. Push to the branch, then create a
+production deployment for it and wait for **READY / PROMOTED**.
 
-### If it is not configured
+Before pushing, the local checks that cover this deployment:
 
-`/api/*` answers `503 {"error_code":"engine_not_configured"}` and the UI says
-*"Not connected to the AutoClip engine yet: set the engine address in your
-deployment settings and try again."*
-
-If the engine is chosen but down, you get `502 {"error_code":"engine_unreachable"}`
-(*"Cannot reach the AutoClip engine — check that the container is running."*)
-
-Before this proxy existed, a `POST /api/...` fell through the SPA catch-all and
-static hosting rejected it as **405** — the "Request failed with status code 405"
-banner. Any bare 405 on an `/api` call now means the middleware did not run.
-
-### Why not call the engine directly
-
-You can, with `VITE_API_BASE_URL=https://YOUR-ENGINE-HOST` as a build variable —
-but then you also need `AUTOCLIP_ALLOWED_ORIGINS=https://YOUR-PROJECT.vercel.app`
-on the engine, every write gets a CORS preflight, and any URL change needs a
-rebuild. The proxy is the simpler contract and is what is deployed.
-
-## 3. Use it
-
-1. Open the Vercel URL.
-2. Import a video. With subtitle mode, upload the `.srt` alongside it (or use a
-   video whose subtitle file ships next to it).
-3. Wait for the progress to hit 100% and download clips.
-
-The first thing to check after import is that Settings shows
-`AutoClip 离线引擎（无需密钥）` as the analysis connection.
-
----
+```bash
+pytest backend/tests/test_vercel_runtime.py     # the deployment's assumptions
+cd frontend && npm test && npx tsc --noEmit     # UI + types
+```
 
 ## What this deployment cannot do
 
-- **Speech-to-text on arbitrary uploads.** No Whisper in the image
-  (`subtitle` analysis mode). Upload a subtitle file, or set a cloud ASR
-  provider in Settings.
+- **Speech-to-text.** No Whisper in the bundle (`subtitle` analysis mode), so an
+  upload needs its `.srt`; a link import gets the platform's subtitles. Set a
+  cloud ASR provider in Settings if you want audio transcription.
+- **Uploads over 4.5 MB.** A Vercel cap, not an app limit — use the link import
+  or a smaller file. Self-hosted/container deploys have no such cap.
+- **Translation.** A key-free engine has no second language, so a clip whose
+  audience language differs from the source keeps its source captions instead of
+  an invented translation.
 - **Nuanced topic detection.** The deterministic engine segments and ranks; it
-  does not understand the video.
-- **Survive a redeploy without a disk.** Container filesystems are ephemeral;
-  mount `/app/data` on a paid plan to keep projects between deploys.
+  does not understand the video the way a real model does.
+- **Very long sources.** One invocation has 300 s and `/tmp` only. A 90 s source
+  on three platforms renders in ~180 s; a 90-minute source belongs on §5.
+- **Durable storage.** `/tmp` is per-instance: a project does not survive a new
+  instance. Finished clips are downloadable immediately; the Supabase library
+  below is the durable option.
 
 ## Supabase (optional clip library)
 
@@ -219,18 +249,33 @@ container's lifetime.
 
 ## Verifying the key-free path locally
 
-```bash
-AUTOCLIP_OFFLINE_ENGINE=local \
-AUTOCLIP_DATA_DIR=/tmp/autoclip-check \
-.venv/bin/python -c 'from backend.core.offline_bootstrap import install; install()' &
-
-curl -s localhost:8100/v1/models
-cd frontend && VITE_API_BASE_URL=http://127.0.0.1:8100 npm run build
-```
-
-Tests:
+The same function the deployment runs, on this machine, with no keys:
 
 ```bash
-.venv/bin/python -m pytest backend/tests/test_offline_engine.py -q   # 33 passed
-cd frontend && node --require ./tests/setup.cjs --test tests/hosted-api-base.test.cjs
+cd frontend
+PATH="/path/to/.venv/bin:$PATH" \
+  AUTOCLIP_OFFLINE_ENGINE=local \
+  /path/to/.venv/bin/python -m uvicorn api.index:app --host 127.0.0.1 --port 8097
+
+curl -s localhost:8097/api/v1/studio/readiness        # ready: true, analysis configured
+curl -s -X POST localhost:8097/api/v1/studio/import \
+  -F "video=@source.mp4" -F "subtitle=@source.srt" \
+  -F 'platforms=douyin' -F 'goal=content' -F 'auto_start=true'
+curl -s localhost:8097/api/v1/studio/<project_id>      # poll generation.status
 ```
+
+That is the exact ASGI app (`app`, drain wrapper included) Vercel serves, so a
+pass here means the deployment's own code path passed.
+
+Tests that cover this deployment specifically:
+
+```bash
+.venv/bin/python -m pytest backend/tests/test_vercel_runtime.py -q   # 24 passed
+.venv/bin/python -m pytest backend/tests/test_offline_engine.py -q
+cd frontend && npm test && npx tsc --noEmit
+```
+
+`test_vercel_runtime.py` asserts the things that fail silently in production: the
+entrypoint exists and exposes `app`, the middleware does not shadow it, every
+render dispatch is counted and drainable, the offline engine understands each
+prompt the studio sends, and a stale offline-engine port is rewritten on startup.
