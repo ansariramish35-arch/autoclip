@@ -40,7 +40,10 @@ cp -r "$ROOT/vendor/ffmpeg" "$API_DIR/vendor/ffmpeg"
 chmod +x "$API_DIR/vendor/ffmpeg/ffmpeg" "$API_DIR/vendor/ffmpeg/ffprobe"
 
 echo "== 3/4 frontend =="
-(cd frontend && npm run build)
+# Vercel rejects a request body over 4.5 MB at the edge; the UI explains that limit
+# instead of letting the upload fail as a network error. Hosted builds only, so a
+# self-hosted API (no cap) keeps its unlimited upload.
+(cd frontend && VITE_UPLOAD_LIMIT_MB="${AUTOCLIP_UPLOAD_LIMIT_MB:-4.2}" npm run build)
 
 echo "== 4/4 measure the function payload =="
 ff=$(du -sm "$API_DIR/vendor/ffmpeg" | cut -f1)

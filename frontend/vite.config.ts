@@ -61,6 +61,9 @@ export default defineConfig(({ mode, command }) => {
       // constant so the first request goes to the right host. Empty keeps the
       // relative /api/v1 path (dev server proxy, desktop, same-origin image).
       __AUTOCLIP_API_BASE__: JSON.stringify((env.VITE_API_BASE_URL || '').trim()),
+      // Hosted function hosts reject a request body over 4.5 MB before it runs.
+      // 0 disables the pre-upload check (self-hosted API, unlimited upload).
+      __AUTOCLIP_UPLOAD_LIMIT_MB__: JSON.stringify(Number(env.VITE_UPLOAD_LIMIT_MB || 0) || 0),
     },
     base: isProduction ? './' : '/', // 生产环境使用相对路径
     optimizeDeps: {

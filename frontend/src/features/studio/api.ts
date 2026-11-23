@@ -8,6 +8,7 @@ import { probeConfig } from './transcriptionRecovery'
 import { Draft, Workspace, RenderJob, Language, CandidateList, ImportOptions, Goal, AnalysisMode, AnalysisPreferences, SubtitleCue, FramingStatus, AutoFrameResult, PlatformStrategySummary, OutputVariant, PostCopy } from './types'
 import { noteWorkspaceCompletion } from './noticeRuntime'
 import { effectiveSubtitles } from './subtitleState'
+import { uploadLimitError } from './uploadLimit'
 export type SourcePreview = { status: 'idle' | 'queued' | 'running' | 'completed' | 'failed'; version?: string; error?: string }
 export function draftProperties(draft?: Partial<Draft>): Properties {
   const packaging = draft?.packaging
@@ -91,6 +92,9 @@ signal); every HTTP answer (even a 500) is seen. */
   titlePreview: (pid: string, draft: Draft, signal?: AbortSignal, layer = 'artwork'): Promise<Blob> => api.post(`/studio/${pid}/title-preview?layer=${layer}`, draft, {responseType:'blob', signal}),
   candidates: (pid: string, signal?: AbortSignal): Promise<CandidateList> => api.get(`/studio/${pid}/candidates`, { signal }),
   import: (body: FormData): Promise<{ project_id: string; analysis_run_id?: string }> => {
+    // A hosted function host rejects a large body before it reaches us; say so here.
+    const tooLarge = uploadLimitError((body.get('video') as File | null)?.size)
+    if (tooLarge) return Promise.reject(new Error(tooLarge))
     const props = studioImportProperties(body)
     return observeStudioOperation('studio_import', () => api.post('/studio/import', body, { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 0 }), (result: { project_id: string; analysis_run_id?: string }, observed) => {
       workflow.rememberProject(result.project_id, props)
