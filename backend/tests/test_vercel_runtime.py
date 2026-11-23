@@ -342,3 +342,21 @@ def test_a_freshly_queued_variant_gets_a_dispatch_grace_window():
     assert not store._queued_long_enough({"created_at": fresh})
     assert store._queued_long_enough({"created_at": old})
     assert store._queued_long_enough({})
+
+
+def test_the_studio_import_batch_fits_one_invocation():
+    """One request may hold the function for `maxDuration`; the batch must fit.
+
+    The drain wrapper keeps the invocation alive until the renders it started are
+    done, under a 280 s budget inside the 300 s cap. Measured on this build
+    (iwr, 90 s source, 3 platforms): 9 clips in 180 s. A regression that makes a
+    clip much slower would push a normal batch past the cap, so the per-clip
+    budget is pinned here rather than discovered in production.
+    """
+    from backend.services.studio import jobs
+
+    # Encodes are serial by design (one render thread): parallelism here is what
+    # turns 180 s into a timeout on the single vCPU a function gets.
+    source = _read(ROOT / "backend" / "services" / "studio" / "jobs.py")
+    assert "render_executor = ThreadPoolExecutor(max_workers=1" in source
+    assert "ThreadPoolExecutor" in source
