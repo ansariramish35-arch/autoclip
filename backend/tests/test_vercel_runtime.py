@@ -330,3 +330,15 @@ def test_a_variant_orphaned_without_a_claim_is_settled_so_it_can_be_retried(tmp_
     assert not store.render_alive({"status": "queued", "queued_by_instance": "an-instance-that-is-gone"})
     assert store.render_alive({"status": "queued", "render_dispatch_claimed": True})
     assert store.render_alive({"status": "queued", "render_job_id": "abc"})
+
+
+def test_a_freshly_queued_variant_gets_a_dispatch_grace_window():
+    """A browser poll can land on another instance between queueing and dispatch."""
+    import datetime as dt
+    from backend.services.studio import store
+
+    fresh = dt.datetime.now(dt.timezone.utc).isoformat()
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=store.ORPHAN_GRACE_SEC + 5)).isoformat()
+    assert not store._queued_long_enough({"created_at": fresh})
+    assert store._queued_long_enough({"created_at": old})
+    assert store._queued_long_enough({})

@@ -153,6 +153,23 @@ def variant_identity(variant):
                  ('id', 'draft_id', 'draft_revision', 'preparation_run_id', 'render_attempt_id'))
 
 
+# A variant is only an orphan once it has had time to be claimed: the dispatch that
+# will claim it may be running on the instance that queued it, and a browser poll can
+# land on a different instance in between. Longer than any healthy dispatch gap.
+ORPHAN_GRACE_SEC = float(os.getenv('AUTOCLIP_ORPHAN_GRACE_SEC', '120'))
+
+
+def _queued_long_enough(variant) -> bool:
+    """True when a queued variant is older than the dispatch grace window."""
+    try:
+        queued = datetime.fromisoformat(str(variant.get('created_at')))
+    except (TypeError, ValueError):
+        return True  # no timestamp: older records, treat as old
+    if queued.tzinfo is None:
+        queued = queued.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - queued).total_seconds() >= ORPHAN_GRACE_SEC
+
+
 def render_alive(variant) -> bool:
     """Whether something could still turn this queued variant into a render.
 
@@ -521,7 +538,8 @@ def recover(project_id: str):
             variant.pop('render_dispatch_instance', None)
             abandoned_claim = True
             settle = True
-        elif (variant.get('status') == 'queued' and not variant.get('render_job_id') and not render_alive(variant)):
+        elif (variant.get('status') == 'queued' and not variant.get('render_job_id')
+              and not render_alive(variant) and _queued_long_enough(variant)):
             # Queued, never claimed, and nothing is left to claim it. On a server a retry could
             # still pick it up, but the reader cannot know that: if the dispatch that would have
             # claimed it is gone (a function instance frozen between creating the variants and
