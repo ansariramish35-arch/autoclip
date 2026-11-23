@@ -37,11 +37,47 @@ def install() -> None:
         logger.warning("离线引擎设置写入失败（可继续手动配置）: %s", type(error).__name__)
 
 
+def _resync_endpoint(target, url: str) -> bool:
+    """Point an existing offline-engine connection at the port bound this start.
+
+    The engine binds a free port (8100 when it is free, otherwise whatever the
+    kernel hands out) and the settings document stores that URL. After a restart
+    the stored port is dead, so every analysis call fails with ``connection``
+    even though the engine is running. This rewrites only our own connection;
+    an operator's own provider is never touched.
+    """
+    import json
+
+    try:
+        with open(target, encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, ValueError) as error:
+        logger.warning("离线引擎设置无法读取（保留原文件）: %s", type(error).__name__)
+        return False
+    if not isinstance(document, dict):
+        return False
+    connections = document.get("connections")
+    if not isinstance(connections, list):
+        return False
+    changed = False
+    for connection in connections:
+        if isinstance(connection, dict) and connection.get("id") == CONNECTION_ID:
+            if connection.get("base_url") != url:
+                connection["base_url"] = url
+                changed = True
+    if not changed:
+        return False
+    _atomic_write(target, document)
+    logger.info("离线引擎地址已同步: %s", url)
+    return True
+
+
 def _seed_settings(url: str) -> None:
     from backend.services import ai_model_settings
 
     target = ai_model_settings.path()
     if target.exists() and target.stat().st_size > 0:
+        _resync_endpoint(target, url)  # load() reads the file, so no cache to clear
         logger.info("已存在模型设置，保留用户配置，不写入离线引擎")
         return
 

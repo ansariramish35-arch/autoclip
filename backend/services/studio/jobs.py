@@ -1,6 +1,7 @@
 import json
 import logging
 import shutil
+import threading
 from time import monotonic, sleep
 from backend.core.failure_codes import UserFacingError, sentence, user_visible_error
 from backend.core.sentry_setup import capture_studio_exception, studio_error_code, studio_failure_context
@@ -42,6 +43,68 @@ def _carried_progress(previous):
 # Local encodes are CPU-bound: run one at a time on its own worker so screening and
 # analysis of other imports never wait behind a render queue.
 render_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='studio-render')
+
+
+class _Pending:
+    """Track dispatched work so a serverless host can keep its response open.
+
+    A thread pool is the right model for a long-lived server: the request returns
+    at once and the browser polls. A function host freezes everything the moment
+    the response is sent, so the same code would accept an import and never
+    render it. drain() lets the entrypoint wait for the work it just scheduled,
+    while the server keeps its existing behaviour (nobody calls it there).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._outstanding = 0
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def note_submit(self):
+        with self._lock:
+            self._outstanding += 1
+            self._idle.clear()
+
+    def note_done(self):
+        with self._lock:
+            self._outstanding = max(0, self._outstanding - 1)
+            if self._outstanding == 0:
+                self._idle.set()
+
+    def drain(self, timeout=None):
+        """Block until dispatched studio work finishes. Returns True if idle."""
+        return self._idle.wait(timeout)
+
+
+PENDING = _Pending()
+
+
+def outstanding_work():
+    """How many studio jobs are still running (0 means nothing to drain)."""
+    with PENDING._lock:
+        return PENDING._outstanding
+
+
+def _submit(pool, fn, /, *args, **kwargs):
+    """Submit to a pool and count it as outstanding until it has run.
+
+    The call goes through unchanged (no wrapper closure) so a test executor keeps
+    seeing the real arguments, and the counter drops on completion, cancellation
+    or failure alike.
+    """
+    PENDING.note_submit()
+    try:
+        future = pool.submit(fn, *args, **kwargs)
+    except BaseException:
+        PENDING.note_done()
+        raise
+    add_done = getattr(future, 'add_done_callback', None)
+    if callable(add_done):
+        add_done(lambda _future: PENDING.note_done())
+    else:
+        PENDING.note_done()  # a stub that already ran the work inline
+    return future
 
 
 def source(project_id):
@@ -100,7 +163,7 @@ def export(project_id, draft, *, brand_outro=False, _variant_identity=None, html
                     render_kwargs['html_fallback'] = job['html_fallback']
                     if job.get('requested_template'):
                         render_kwargs['requested_template'] = job['requested_template']
-                render_executor.submit(
+                _submit(render_executor,
                     _render, project_id, draft, job['job_id'],
                     _io_receipt=('render', job['job_id']), **render_kwargs,
                 )
@@ -1233,7 +1296,7 @@ def request_ai_cover(project_id, variant_id):
         claimed = store.change(project_id, claim)
         if claimed['job_id'] == job_id:
             try:
-                cover_executor.submit(_ai_cover_job, project_id, variant_id, job_id, _io_receipt=('cover', variant_id, job_id))
+                _submit(cover_executor, _ai_cover_job, project_id, variant_id, job_id, _io_receipt=('cover', variant_id, job_id))
             except Exception as error:  # noqa: BLE001 - preserve the ready video and designed cover
                 store.remember_submission_rejection(project_id, ('cover', variant_id, job_id), error_code=studio_error_code(error))
                 logger.warning('AI cover dispatch failed: %s', type(error).__name__)
@@ -1557,7 +1620,7 @@ def _submit_production(project_id, run_id, plan, *, attempt_id=None):
                 store.change(project_id, _stamp_quota)
             except Exception:  # noqa: BLE001
                 pass
-        executor.submit(_auto_generate, project_id, plan, _io_receipt=('analysis', run_id, 'production'))
+        _submit(executor, _auto_generate, project_id, plan, _io_receipt=('analysis', run_id, 'production'))
     except Exception as error:
         store.analysis_handoff_rejected(project_id, run_id)
         store.remember_submission_rejection(project_id, ('analysis', run_id, 'production'), error_code=studio_error_code(error))
@@ -1903,7 +1966,7 @@ def _start_preparing(data, item):
 
 def _submit_on_demand(project_id, variant_id, attempt_id):
     try:
-        executor.submit(_produce_on_demand, project_id, variant_id, _io_receipt=('preparation', variant_id, attempt_id))
+        _submit(executor, _produce_on_demand, project_id, variant_id, _io_receipt=('preparation', variant_id, attempt_id))
     except Exception as error:
         store.remember_submission_rejection(project_id, ('preparation', variant_id, attempt_id), error_code=studio_error_code(error))
         capture_studio_exception(error, 'dispatch')
@@ -2138,7 +2201,7 @@ def inspect_project(project_id, options, url=None, browser=None, *, producer=Non
         if options.auto_start:
             _prepare_speaker_framing(options.platforms)
         try:
-            executor.submit(_inspect, project_id, options, url, browser, _io_receipt=('analysis', state['analysis']['run_id'], 'screening'))
+            _submit(executor, _inspect, project_id, options, url, browser, _io_receipt=('analysis', state['analysis']['run_id'], 'screening'))
         except Exception as error:
             store.remember_submission_rejection(project_id, ('analysis', state['analysis']['run_id'], 'screening'), error_code=studio_error_code(error))
             logger.warning('Studio screening dispatch failed: %s', type(error).__name__)
@@ -2266,7 +2329,7 @@ def confirm_project(project_id, body):
         attempts.bind_plan(pending, plan)  # the confirmed plan is this attempt's own
         store.write(project_id, state)
         try:
-            executor.submit(_produce_selected, project_id, plan, _io_receipt=('analysis', state['analysis']['run_id'], 'production'))
+            _submit(executor, _produce_selected, project_id, plan, _io_receipt=('analysis', state['analysis']['run_id'], 'production'))
         except Exception as error:
             store.remember_submission_rejection(project_id, ('analysis', state['analysis']['run_id'], 'production'), error_code=studio_error_code(error))
             logger.warning('Studio production dispatch failed: %s', type(error).__name__)

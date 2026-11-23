@@ -48,6 +48,9 @@ _SCORING_MARKER = "进行综合评估，并给出一个最终分数"
 _TITLE_MARKER = "生成**1个**最佳的"
 _CLUSTER_MARKER = "对它们进行主题聚类"
 _POST_COPY_MARKER = "为 platforms 里的每个平台写发布文案"
+_PACKAGING_MARKER = "为这段访谈做包装"
+_CLIP_FINDER_MARKER = "挑出所有值得单独发布成短视频的片段"
+_BOUNDARY_MARKER = "请调整首尾"
 
 # Sentence-final punctuation, plus soft breaks CJK subtitles actually use.
 _SENTENCE_END = "。！？!?；;….．"
@@ -476,6 +479,15 @@ def answer(prompt: str, input_data: Any = None) -> str:
         clips = _parse_cluster_prompt(prompt)
         return json.dumps(cluster_clips(clips), ensure_ascii=False)
 
+    if _CLIP_FINDER_MARKER in prompt:
+        return json.dumps(build_clip_windows(payload if isinstance(payload, dict) else {}), ensure_ascii=False)
+
+    if _BOUNDARY_MARKER in prompt:
+        return json.dumps(build_boundary(payload if isinstance(payload, dict) else {}), ensure_ascii=False)
+
+    if _PACKAGING_MARKER in prompt:
+        return json.dumps(build_packaging(payload if isinstance(payload, dict) else {}), ensure_ascii=False)
+
     if _POST_COPY_MARKER in prompt:
         return json.dumps(build_posts(payload if isinstance(payload, dict) else {}), ensure_ascii=False)
 
@@ -499,6 +511,228 @@ def _parse_cluster_prompt(prompt: str) -> list[dict[str, Any]]:
                 pass
     return clips
 
+
+
+
+# --------------------------------------------------------------- clip finder ---
+def _clock(seconds: float) -> str:
+    seconds = int(max(0.0, seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def build_clip_windows(payload: dict[str, Any]) -> dict[str, Any]:
+    """Complete-answer windows from the ``rows`` block of the clip-finder prompt.
+
+    Each row is ``index|m:ss|text``. A window starts where a question or a new
+    statement starts and ends after the last sentence of the answer, so a cut
+    never lands mid-sentence and never swallows the next question.
+    """
+    rows = []
+    for line in str(payload.get("rows") or "").splitlines():
+        parts = line.split("|", 2)
+        if len(parts) != 3 or not parts[0].strip().isdigit():
+            continue
+        rows.append((int(parts[0]), parts[1].strip(), parts[2].strip()))
+    if not rows:
+        return {"clips": []}
+
+    # Sentences, each remembering the row span it covers.
+    sentences: list[tuple[int, int, str]] = []
+    start, buffer = rows[0][0], ""
+    for index, _, text in rows:
+        buffer = f"{buffer}{text}".strip()
+        if buffer and (buffer[-1] in "。！？!?." or len(buffer) >= 90):
+            sentences.append((start, index, buffer))
+            start, buffer = index + 1, ""
+    if buffer:
+        sentences.append((start, rows[-1][0], buffer))
+    if not sentences:
+        return {"clips": []}
+
+    # A window is 1-2 sentences: long enough to carry a claim, short enough to post.
+    windows: list[dict[str, Any]] = []
+    step = 2
+    for position in range(0, len(sentences), step):
+        group = sentences[position:position + step]
+        first_row, last_row = group[0][0], group[-1][1]
+        body = "".join(item[2] for item in group)
+        title = _pack_title_lines(body, 20, "zh")
+        windows.append({
+            "start": first_row,
+            "end": last_row,
+            "title": (title[0] if title else _salient(body, 20))[:20],
+            "reason": f"完整观点：{_salient(body, 24)}",
+            "score": 0.78 if len(body) >= 24 else 0.6,
+        })
+    return {"clips": windows[:5]}
+
+
+def build_boundary(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep the proposed cut, moved off a half sentence when that is possible.
+
+    The engine has no semantic judgement, so it does the one thing it can prove:
+    never end on a row that is clearly unfinished, and never start on a
+    continuation row. Everything else is left exactly as proposed.
+    """
+    lines = payload.get("lines") if isinstance(payload.get("lines"), list) else []
+    texts = {item.get("id"): str(item.get("text") or "") for item in lines if isinstance(item, dict)}
+    start = payload.get("start_line")
+    end = payload.get("end_line")
+    if not isinstance(start, int) or not isinstance(end, int):
+        return {"start_line": start or 0, "end_line": end or 0, "reason": "保持原切点"}
+    last = max(texts) if texts else 0
+    # Do not end on an unfinished clause: extend while the next row continues it.
+    while isinstance(end, int) and end < last and texts.get(end) and texts[end][-1] not in "。！？!?.":
+        end += 1
+    # Do not start on a continuation row that opens with a connective.
+    while start < end and str(texts.get(start) or "").lstrip().startswith(("但是", "而且", "然后", "所以", "那")):
+        start += 1
+    return {"start_line": start, "end_line": end, "reason": "已对齐到完整句子"}
+
+
+# ----------------------------------------------------------------- packaging ---
+_LATIN_RUN = re.compile(r"[A-Za-z0-9]")
+
+
+def _pack_line(text: str, limit: int) -> str:
+    """Shorten to `limit` characters without cutting a word or leaving a dangling letter.
+
+    ``为什么大多数公司做不好AI转型？`` at a 12-character cap must not become
+    ``为什么大多数公司做不好A``: the Latin token is atomic, so it is dropped whole
+    (and then any trailing connective) rather than halved into a meaningless letter.
+    """
+    text = str(text or "").strip().rstrip("，,、；;：:")
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    # Never stop inside a Latin/number run.
+    while cut and _LATIN_RUN.match(cut[-1]) and len(cut) < len(text) and _LATIN_RUN.match(text[len(cut)]):
+        cut = cut[:-1]
+    cut = cut.rstrip("，,、；;：: 和与的了是在把对从").rstrip("。.！!？?") 
+    return cut or text[:limit]
+
+
+def _pack_title_lines(text: str, limit: int, audience: str) -> list[str]:
+    """One or two title lines, each inside the platform's cap, broken at a natural joint.
+
+    The packaging validator re-wraps anything longer than the cap and drops titles it
+    cannot balance, so a title built here is wrapped by the same layout code the
+    captions use: punctuation first, then soft joints, never through a CJK word.
+    """
+    from backend.services.studio.caption_layout import lines_for
+    for sentence in _post_sentences(text)[:8]:
+        clean = _salient(_clean(sentence), max(limit * 2, 24))
+        if len(clean) < 4:
+            continue
+        clean = _pack_line(clean, max(limit * 2, 24))
+        if not clean:
+            continue
+        if len(clean) <= limit:
+            return [clean]
+        if audience == "zh":
+            wrapped = [line.strip().rstrip("，,、；;：:") for line in lines_for(clean, limit) if line.strip()]
+            # Two lines are only worth it when both carry a phrase; a 4-character
+            # tail ("好AI转型") is a broken word, so shorten to one line instead.
+            if len(wrapped) == 2 and min(len(line) for line in wrapped) >= max(6, limit // 2):
+                return wrapped
+            return [_pack_line(clean, limit)]
+        import textwrap
+        wrapped = [line.strip() for line in textwrap.wrap(clean, width=limit) if line.strip()]
+        if wrapped and len(wrapped) <= 2 and all(len(line) <= limit for line in wrapped):
+            return wrapped
+        return [_pack_line(clean, limit)]
+    return []
+
+
+def build_packaging(payload: dict[str, Any]) -> dict[str, Any]:
+    """Packaging metadata derived from the transcript.
+
+    The model is asked for titles, sentence segments, speakers, emphasis marks
+    and tags. Everything here is extractive: titles come from the clip's own
+    opening sentences, segments rejoin ASR fragments into complete sentences,
+    emphasis is a substring of the line it points at, and speakers are left
+    empty unless the transcript actually names someone.
+    """
+    template = str(payload.get("template") or "interview_zh")
+    audience = str(payload.get("audience_language") or "zh")
+    limit = int(payload.get("title_limit") or (20 if audience == "zh" else 60))
+    raw_lines = payload.get("lines") if isinstance(payload.get("lines"), list) else []
+    lines = [str((item or {}).get("text") or "") for item in raw_lines if isinstance(item, dict)]
+    text = " ".join(line for line in lines if line)
+
+    if payload.get("translate") is True:
+        # A key-free engine has no second language. Saying so lets the caller skip two
+        # fruitless attempts and take its documented "keep the source captions" path.
+        return {"translate_unsupported": True, "title_lines": [], "segments": []}
+
+    title_lines = _pack_title_lines(text, limit, audience)
+
+    # Rejoin ASR fragments into sentences, then map each sentence back to the
+    # line ids it covers: segments must be contiguous, ordered, non-overlapping
+    # and cover every line.
+    segments: list[dict[str, Any]] = []
+    if payload.get("translate") is not True and lines:
+        start, buffer = 0, ""
+        for index, line in enumerate(lines):
+            buffer = f"{buffer} {line}".strip()
+            sentence_end = bool(buffer) and buffer[-1] in "。！？!?.;；"
+            long_enough = len(buffer) >= 40
+            if (sentence_end or long_enough) and index - start < 4:
+                segments.append({"from": start, "to": index, "text": ""})
+                start, buffer = index + 1, ""
+        if start < len(lines):
+            segments.append({"from": start, "to": len(lines) - 1, "text": ""})
+
+    # A highlight must be a literal substring of the line it points at.
+    highlights: list[dict[str, Any]] = []
+    if template == "podcast_en":
+        for index, line in enumerate(lines):
+            if index % 3:
+                continue
+            words = [w for w in re.findall(r"[A-Za-z][A-Za-z'-]{4,}", line) if w.lower() not in _EN_STOP]
+            if words:
+                highlights.append({"line": index, "word": words[0]})
+
+    # Editorial notes only exist for the interview template, and only when the
+    # transcript supplies a concrete noun phrase to point at.
+    tags: list[dict[str, Any]] = []
+    if template == "interview_zh" and audience == "zh":
+        for index, line in enumerate(lines):
+            phrase = _post_tags(line, 1, "zh")
+            if phrase:
+                tags.append({"line": index, "text": phrase[0][:10]})
+            if len(tags) >= 3:
+                break
+
+    marks: list[dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        phrase = _post_tags(line, 1, audience if audience == "en" else "zh")
+        if not phrase:
+            continue
+        word = phrase[0]
+        if word not in line:
+            continue
+        marks.append({"line": index, "text": word})
+
+    mood = "calm"
+    lowered = text.casefold()
+    if any(word in lowered for word in ("错", "失败", "危机", "风险", "问题", "fail", "risk", "crisis", "wrong")):
+        mood = "serious"
+    elif any(word in lowered for word in ("必须", "一定", "关键", "核心", "根本", "must", "never", "critical")):
+        mood = "bold"
+
+    return {
+        "title_lines": title_lines,
+        "accent_line": 0 if len(title_lines) > 1 else None,
+        "segments": segments,
+        "speakers": [],
+        "tags": tags,
+        "highlights": highlights,
+        "marks": marks,
+        "mood": mood,
+    }
 
 
 # ----------------------------------------------------------------- post copy ---

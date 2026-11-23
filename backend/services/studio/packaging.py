@@ -160,6 +160,8 @@ def draft_lines(entries: list[dict[str, Any]], scenes: list[dict[str, Any]]) -> 
 
 
 def _fallback_title(draft: dict[str, Any], language: str) -> list[str]:
+    if not str(draft.get('hook') or draft.get('title') or '').strip():
+        return []  # a template without a title burns no empty headline
     import textwrap
     text = _clean(draft.get('hook') or draft.get('title') or '')
     # Width follows the title's own language: an English title on a Chinese platform is not cut at 12.

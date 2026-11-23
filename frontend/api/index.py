@@ -104,6 +104,49 @@ def _configure() -> None:
 
 _configure()
 
-from backend.main import app  # noqa: E402  (must follow _configure)
+from backend.main import app as _app  # noqa: E402  (must follow _configure)
+
+# How long a single request may wait for work it started. Vercel's maxDuration is
+# 300s on Hobby; stop short of it so the client gets a real response instead of a
+# 504 with no body.
+DRAIN_BUDGET_SEC = float(os.getenv("AUTOCLIP_SERVERLESS_DRAIN_SEC", "280"))
+
+
+class _DrainAfterResponse:
+    """Hold the response open until the studio work a request started is done.
+
+    The studio dispatches renders to a ThreadPoolExecutor and answers at once, so
+    the browser can poll. That is correct on a server and fatal on a function
+    host: Vercel freezes everything the moment the response is sent, so an
+    import would be accepted and never rendered, and the UI would poll forever.
+
+    Wrapping the ASGI app (rather than editing each route) keeps one rule in one
+    place: a request that scheduled work does not finish until that work has. A
+    request that scheduled nothing returns immediately and unchanged.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            from backend.services.studio import jobs
+        except Exception:  # noqa: BLE001 - never break a request over this
+            await self.app(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+        # Only after the client already has its response: the work is scheduled,
+        # nothing is left to compute but the jobs themselves.
+        if jobs.outstanding_work():
+            import anyio
+
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(jobs.PENDING.drain, DRAIN_BUDGET_SEC)
+
+
+app = _DrainAfterResponse(_app)
 
 __all__ = ["app"]
